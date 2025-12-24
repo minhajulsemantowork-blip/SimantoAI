@@ -195,6 +195,25 @@ def home():
     return "🤖 Simanto AI Bot is running!"
 
 # ----- WEBHOOK -----
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token:
+        # Firestore থেকে verify token খোঁজা
+        clients = db.collection("clients").get()
+        for client in clients:
+            data = client.to_dict()
+            fb = data.get("integrations", {}).get("facebook", {})
+            if fb.get("verifyToken") == token:
+                return challenge, 200
+
+        return "Invalid verify token", 403
+
+    return "Invalid request", 400
+
 @app.route("/webhook", methods=["POST"])
 def on_message_received():
     data = request.get_json()
