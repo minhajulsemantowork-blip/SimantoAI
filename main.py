@@ -67,7 +67,7 @@ def generate_order_id(client_id):
     counter = len(existing_orders) + 1
     return f"ORD{today}-{counter:03d}"
 
-# ----- SAVE ORDER -----
+# ----- SAVE ORDER ----- 
 def save_order(client_id, order_data):
     order_id = generate_order_id(client_id)
     order_doc = {
@@ -202,16 +202,22 @@ def on_message_received():
     reply = chat_with_gemini(client_id, user_text)
     return jsonify({"reply": reply})
 
-# ----- MAIN LOOP (for local testing) -----
+# ----- RUN SERVER ONLY -----
 if __name__ == "__main__":
-    print(f"🤖 {BOT_NAME} is now running... (type 'exit' to quit)\n")
-    while True:
-        page_id = input("Page ID: ")
-        user_input = input("You: ")
+    import sys
+    # Check if running on Render (no stdin)
+    if os.environ.get("RENDER") == "true":
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    else:
+        # Local testing loop
+        print(f"🤖 {BOT_NAME} is now running locally... (type 'exit' to quit)\n")
+        while True:
+            page_id = input("Page ID: ")
+            user_input = input("You: ")
 
-        if user_input.lower() in ["exit", "quit", "bye"]:
-            print(f"{BOT_NAME}: Bye ❤️")
-            break
+            if user_input.lower() in ["exit", "quit", "bye"]:
+                print(f"{BOT_NAME}: Bye ❤️")
+                break
 
-        reply = chat_with_gemini(client_id=get_client_id_by_page(page_id), user_text=user_input)
-        print(f"{BOT_NAME}: {reply}\n")
+            reply = chat_with_gemini(client_id=get_client_id_by_page(page_id), user_text=user_input)
+            print(f"{BOT_NAME}: {reply}\n")
