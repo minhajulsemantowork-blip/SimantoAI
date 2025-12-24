@@ -1,6 +1,6 @@
-Flask==3.1.2
-firebase_admin==7.1.0
-google-genai==1.52.0
+Flask==3.0.0
+firebase-admin==6.4.0
+google-genai==0.3.0
 langdetect==1.0.9
-python-dotenv==0.21.1
-requests==2.32.5
+gunicorn==21.2.0
+requests==2.31.0
