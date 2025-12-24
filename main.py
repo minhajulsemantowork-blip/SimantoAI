@@ -186,9 +186,15 @@ def chat_with_gemini(client_id, user_text):
 
     return bot_reply
 
-# ----- HANDLE INCOMING MESSAGE -----
+# ----- FLASK APP -----
 app = Flask(__name__)
 
+# ----- HOMEPAGE -----
+@app.route("/", methods=["GET"])
+def home():
+    return "🤖 Simanto AI Bot is running!"
+
+# ----- WEBHOOK -----
 @app.route("/webhook", methods=["POST"])
 def on_message_received():
     data = request.get_json()
@@ -202,14 +208,12 @@ def on_message_received():
     reply = chat_with_gemini(client_id, user_text)
     return jsonify({"reply": reply})
 
-# ----- RUN SERVER ONLY -----
+# ----- MAIN LOOP (local testing) -----
 if __name__ == "__main__":
     import sys
-    # Check if running on Render (no stdin)
     if os.environ.get("RENDER") == "true":
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
     else:
-        # Local testing loop
         print(f"🤖 {BOT_NAME} is now running locally... (type 'exit' to quit)\n")
         while True:
             page_id = input("Page ID: ")
