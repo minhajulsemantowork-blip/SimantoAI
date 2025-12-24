@@ -1,6 +1,6 @@
 Flask==3.1.2
-firebase-admin==7.1.0
+firebase_admin==7.1.0
 google-genai==1.52.0
-google-cloud-firestore==2.21.0
 langdetect==1.0.9
+python-dotenv==0.21.1
 requests==2.32.5
