@@ -1,6 +1,6 @@
 import os
 import json
-import requests  # For sending messages to Facebook
+import requests
 from google import genai
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -101,14 +101,12 @@ def persuasion_suggestions(user_text, language="en", context=None, gemini_api_ke
     if not gemini_api_key:
         return ""
     client = genai.Client(api_key=gemini_api_key)
-
     prompt = f"""
     You are a friendly, polite, persuasive sales assistant.
     User message: "{user_text}"
     Context: "{context}"
     Reply shortly in {language}.
     """
-
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt
@@ -184,58 +182,54 @@ app = Flask(__name__)
 def home():
     return "🤖 Simanto AI Bot is running!"
 
-# =================================================
-# 🔐 WEBHOOK VERIFY (SaaS CORRECT - FIXED TOKEN)
-# =================================================
+# ----- WEBHOOK VERIFY -----
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-
     VERIFY_TOKEN = os.getenv("MASTER_VERIFY_TOKEN")
 
     if token == VERIFY_TOKEN:
         return Response(challenge, status=200)
-
     return Response("Invalid verify token", status=403)
 
-# =================================================
-# 📩 FACEBOOK MESSAGE HANDLER (POST)
-# =================================================
+# ----- FACEBOOK MESSAGE HANDLER (POST) -----
 @app.route("/webhook", methods=["POST"])
 def on_message_received():
     data = request.get_json()
-    entries = data.get("entry", [])
+    print("===== WEBHOOK POST RECEIVED =====")
+    print(json.dumps(data, indent=2))
 
+    entries = data.get("entry", [])
     for entry in entries:
         messaging_events = entry.get("messaging", [])
         for event in messaging_events:
             sender_id = event.get("sender", {}).get("id")
-            page_id = entry.get("id")
             user_text = event.get("message", {}).get("text")
+            page_id = event.get("recipient", {}).get("id")  # ✅ fixed
 
-            if not user_text:
-                continue  # skip non-text events
+            print(f"Sender ID: {sender_id}, Page ID: {page_id}, Message: {user_text}")
 
-            # 1️⃣ Find client by page ID
             client_id = get_client_id_by_page(page_id)
-            if not client_id:
-                print(f"Page {page_id} not linked to any client.")
+            print("Client ID:", client_id)
+
+            if not client_id or not user_text:
                 continue
 
-            # 2️⃣ Generate bot reply
             reply = chat_with_gemini(client_id, user_text)
+            print("Bot reply:", reply)
 
-            # 3️⃣ Fetch client-specific Page Access Token from Firebase
+            # Fetch page token
             client_doc = db.collection("clients").document(client_id).get()
             page_token = client_doc.to_dict().get("integrations", {}).get("facebook", {}).get("pageAccessToken")
+            print("Page token:", page_token[:20] + "...")
 
             if not page_token:
-                print(f"No page access token for client {client_id}")
+                print(f"❌ No page access token for client {client_id}")
                 continue
 
-            # 4️⃣ Send reply via Facebook Graph API
-            url = f"https://graph.facebook.com/v17.0/me/messages"
+            # Send reply
+            url = "https://graph.facebook.com/v17.0/me/messages"
             payload = {
                 "messaging_type": "RESPONSE",
                 "recipient": {"id": sender_id},
@@ -243,9 +237,11 @@ def on_message_received():
             }
             params = {"access_token": page_token}
 
-            r = requests.post(url, params=params, json=payload)
-            if r.status_code != 200:
-                print(f"Failed to send message: {r.status_code} - {r.text}")
+            try:
+                r = requests.post(url, params=params, json=payload)
+                print("Graph API response:", r.status_code, r.text)
+            except Exception as e:
+                print("❌ Error sending message:", str(e))
 
     return jsonify({"status": "ok"}), 200
 
