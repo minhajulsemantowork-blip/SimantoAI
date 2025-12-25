@@ -4,13 +4,13 @@ from google import genai
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
-from langdetect import detect  # Language detection
-from flask import Flask, request, jsonify
+from langdetect import detect
+from flask import Flask, request, jsonify, Response
 
 # ----- CONFIG -----
 BOT_NAME = "Simanto"
 
-# Firebase setup
+# ----- FIREBASE SETUP -----
 FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT)
 cred = credentials.Certificate(cred_dict)
@@ -33,8 +33,7 @@ def save_memory(client_id, memory):
 def get_gemini_key(client_id):
     try:
         doc = db.collection("clients").document(client_id).get()
-        key = doc.to_dict().get("settings", {}).get("apiKeys", {}).get("geminiApiKey")
-        return key  # No fallback
+        return doc.to_dict().get("settings", {}).get("apiKeys", {}).get("geminiApiKey")
     except:
         return None
 
@@ -43,11 +42,12 @@ def get_client_settings(client_id):
     try:
         doc = db.collection("clients").document(client_id).get()
         data = doc.to_dict()
-        bot_settings = data.get("botSettings", {})
-        business_settings = data.get("businessSettings", {})
-        faqs = data.get("faqs", [])
-        products = data.get("products", [])
-        return bot_settings, business_settings, faqs, products
+        return (
+            data.get("botSettings", {}),
+            data.get("businessSettings", {}),
+            data.get("faqs", []),
+            data.get("products", [])
+        )
     except:
         return {}, {}, [], []
 
@@ -67,7 +67,7 @@ def generate_order_id(client_id):
     counter = len(existing_orders) + 1
     return f"ORD{today}-{counter:03d}"
 
-# ----- SAVE ORDER ----- 
+# ----- SAVE ORDER -----
 def save_order(client_id, order_data):
     order_id = generate_order_id(client_id)
     order_doc = {
@@ -84,7 +84,7 @@ def save_order(client_id, order_data):
     db.collection("clients").document(client_id).collection("orders").add(order_doc)
     return order_id
 
-# ----- EXTRACT ORDER DATA (placeholder) -----
+# ----- NLP PLACEHOLDER -----
 def extract_order_nlp(user_text, language="en"):
     return {
         "product_name": "Unknown Product",
@@ -95,20 +95,17 @@ def extract_order_nlp(user_text, language="en"):
         "address": ""
     }
 
-# ----- SMART PERSUASION MODULE -----
+# ----- PERSUASION MODULE -----
 def persuasion_suggestions(user_text, language="en", context=None, gemini_api_key=None):
     if not gemini_api_key:
         return ""
     client = genai.Client(api_key=gemini_api_key)
 
     prompt = f"""
-    You are a friendly, polite, and persuasive sales assistant.
-    User may hesitate to place an order.
-    Based on the following user message and context, generate a short, friendly suggestion to encourage order confirmation.
-    Maintain {language} language.
+    You are a friendly, polite, persuasive sales assistant.
     User message: "{user_text}"
-    Conversation context: "{context}"
-    Respond only with the suggestion, no explanations.
+    Context: "{context}"
+    Reply shortly in {language}.
     """
 
     response = client.models.generate_content(
@@ -117,19 +114,17 @@ def persuasion_suggestions(user_text, language="en", context=None, gemini_api_ke
     )
     return response.text.strip()
 
-# ----- CHAT FUNCTION -----
+# ----- CHAT -----
 def chat_with_gemini(client_id, user_text):
     memory = load_memory(client_id)
     bot_settings, business_settings, faqs, products = get_client_settings(client_id)
 
-    # Language detection
     try:
         lang = detect(user_text)
         language = "bn" if lang.startswith("bn") else "en"
     except:
         language = "en"
 
-    # Prepare conversation context
     conversation = ""
     for msg in memory["history"]:
         conversation += f"User: {msg['user']}\n{BOT_NAME}: {msg['bot']}\n"
@@ -137,83 +132,61 @@ def chat_with_gemini(client_id, user_text):
 
     context_text = ""
     if bot_settings.get("autoReplyEnabled"):
-        context_text += f"AutoReplyMessage: {bot_settings.get('autoReplyMessage', '')}\n"
-    context_text += f"Business Hours: {business_settings.get('businessHours', '')}\n"
-    context_text += f"Timezone: {business_settings.get('timezone', '')}\n"
+        context_text += bot_settings.get("autoReplyMessage", "") + "\n"
+
     if faqs:
-        context_text += "FAQs:\n" + "\n".join([f"Q:{f.get('question','')}\nA:{f.get('answer','')}" for f in faqs]) + "\n"
+        context_text += "FAQs:\n" + "\n".join(
+            [f"Q:{f.get('question')}\nA:{f.get('answer')}" for f in faqs]
+        ) + "\n"
+
     if products:
-        context_text += "Products:\n" + "\n".join([f"{p.get('name','')} - ৳{p.get('price',0)}" for p in products]) + "\n"
+        context_text += "Products:\n" + "\n".join(
+            [f"{p.get('name')} - ৳{p.get('price')}" for p in products]
+        ) + "\n"
 
-    conversation = context_text + "\n" + conversation
+    conversation = context_text + conversation
 
-    # Gemini API
     GEMINI_API_KEY = get_gemini_key(client_id)
     if not GEMINI_API_KEY:
-        return "⚠️ Gemini API key সেট করা নেই। দয়া করে আপনার ড্যাশবোর্ড থেকে API key যোগ করুন।"
+        return "⚠️ Gemini API key সেট করা নেই।"
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    prompt = f"""
-    You are a friendly, persuasive sales assistant.
-    Reply politely to the user and encourage order confirmation.
-    Maintain {language} language.
-    Conversation so far:
-    {conversation}
-    """
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=prompt
+        contents=conversation
     )
-    bot_reply = response.text.strip()
 
-    # Save memory
+    bot_reply = response.text.strip()
     memory["history"].append({"user": user_text, "bot": bot_reply})
     save_memory(client_id, memory)
-
-    # ----- CHECK IF ORDER DETAILS PROVIDED -----
-    order_confirm_phrases = ["order confirm", "confirm my order", "অর্ডার কনফার্ম", "অর্ডার নিশ্চিত"]
-    if any(phrase in user_text.lower() for phrase in order_confirm_phrases):
-        order_data = extract_order_nlp(user_text, language)
-        order_id = save_order(client_id, order_data)
-        if language == "bn":
-            bot_reply += f"\n✅ অর্ডার কনফার্ম হয়েছে! আপনার অর্ডার আইডি: {order_id}"
-        else:
-            bot_reply += f"\n✅ Order confirmed! Your Order ID is {order_id}"
-    else:
-        suggestion = persuasion_suggestions(user_text, language, context=conversation, gemini_api_key=GEMINI_API_KEY)
-        if suggestion:
-            bot_reply += f"\n💡 {suggestion}"
 
     return bot_reply
 
 # ----- FLASK APP -----
 app = Flask(__name__)
 
-# ----- HOMEPAGE -----
 @app.route("/", methods=["GET"])
 def home():
     return "🤖 Simanto AI Bot is running!"
 
-# ----- WEBHOOK -----
+# =================================================
+# 🔐 WEBHOOK VERIFY (SaaS CORRECT - FIXED TOKEN)
+# =================================================
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token:
-        # Firestore থেকে verify token খোঁজা
-        clients = db.collection("clients").get()
-        for client in clients:
-            data = client.to_dict()
-            fb = data.get("integrations", {}).get("facebook", {})
-            if fb.get("verifyToken") == token:
-                return challenge, 200
+    VERIFY_TOKEN = os.getenv("MASTER_VERIFY_TOKEN")
 
-        return "Invalid verify token", 403
+    if token == VERIFY_TOKEN:
+        return Response(challenge, status=200)
 
-    return "Invalid request", 400
+    return Response("Invalid verify token", status=403)
 
+# =================================================
+# 📩 FACEBOOK MESSAGE HANDLER
+# =================================================
 @app.route("/webhook", methods=["POST"])
 def on_message_received():
     data = request.get_json()
@@ -222,25 +195,11 @@ def on_message_received():
 
     client_id = get_client_id_by_page(page_id)
     if not client_id:
-        return jsonify({"reply": "Sorry, your page is not connected with any client."})
+        return jsonify({"reply": "Page not connected."})
 
     reply = chat_with_gemini(client_id, user_text)
     return jsonify({"reply": reply})
 
-# ----- MAIN LOOP (local testing) -----
+# ----- MAIN -----
 if __name__ == "__main__":
-    import sys
-    if os.environ.get("RENDER") == "true":
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    else:
-        print(f"🤖 {BOT_NAME} is now running locally... (type 'exit' to quit)\n")
-        while True:
-            page_id = input("Page ID: ")
-            user_input = input("You: ")
-
-            if user_input.lower() in ["exit", "quit", "bye"]:
-                print(f"{BOT_NAME}: Bye ❤️")
-                break
-
-            reply = chat_with_gemini(client_id=get_client_id_by_page(page_id), user_text=user_input)
-            print(f"{BOT_NAME}: {reply}\n")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
