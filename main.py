@@ -1,5 +1,6 @@
 import os
 import json
+import requests  # For sending messages to Facebook
 from google import genai
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -160,6 +161,20 @@ def chat_with_gemini(client_id, user_text):
     memory["history"].append({"user": user_text, "bot": bot_reply})
     save_memory(client_id, memory)
 
+    # ----- CHECK IF ORDER DETAILS PROVIDED -----
+    order_confirm_phrases = ["order confirm", "confirm my order", "অর্ডার কনফার্ম", "অর্ডার নিশ্চিত"]
+    if any(phrase in user_text.lower() for phrase in order_confirm_phrases):
+        order_data = extract_order_nlp(user_text, language)
+        order_id = save_order(client_id, order_data)
+        if language == "bn":
+            bot_reply += f"\n✅ অর্ডার কনফার্ম হয়েছে! আপনার অর্ডার আইডি: {order_id}"
+        else:
+            bot_reply += f"\n✅ Order confirmed! Your Order ID is {order_id}"
+    else:
+        suggestion = persuasion_suggestions(user_text, language, context=conversation, gemini_api_key=GEMINI_API_KEY)
+        if suggestion:
+            bot_reply += f"\n💡 {suggestion}"
+
     return bot_reply
 
 # ----- FLASK APP -----
@@ -185,20 +200,54 @@ def verify_webhook():
     return Response("Invalid verify token", status=403)
 
 # =================================================
-# 📩 FACEBOOK MESSAGE HANDLER
+# 📩 FACEBOOK MESSAGE HANDLER (POST)
 # =================================================
 @app.route("/webhook", methods=["POST"])
 def on_message_received():
     data = request.get_json()
-    page_id = data.get("page_id")
-    user_text = data.get("message")
+    entries = data.get("entry", [])
 
-    client_id = get_client_id_by_page(page_id)
-    if not client_id:
-        return jsonify({"reply": "Page not connected."})
+    for entry in entries:
+        messaging_events = entry.get("messaging", [])
+        for event in messaging_events:
+            sender_id = event.get("sender", {}).get("id")
+            page_id = entry.get("id")
+            user_text = event.get("message", {}).get("text")
 
-    reply = chat_with_gemini(client_id, user_text)
-    return jsonify({"reply": reply})
+            if not user_text:
+                continue  # skip non-text events
+
+            # 1️⃣ Find client by page ID
+            client_id = get_client_id_by_page(page_id)
+            if not client_id:
+                print(f"Page {page_id} not linked to any client.")
+                continue
+
+            # 2️⃣ Generate bot reply
+            reply = chat_with_gemini(client_id, user_text)
+
+            # 3️⃣ Fetch client-specific Page Access Token from Firebase
+            client_doc = db.collection("clients").document(client_id).get()
+            page_token = client_doc.to_dict().get("integrations", {}).get("facebook", {}).get("pageAccessToken")
+
+            if not page_token:
+                print(f"No page access token for client {client_id}")
+                continue
+
+            # 4️⃣ Send reply via Facebook Graph API
+            url = f"https://graph.facebook.com/v17.0/me/messages"
+            payload = {
+                "messaging_type": "RESPONSE",
+                "recipient": {"id": sender_id},
+                "message": {"text": reply}
+            }
+            params = {"access_token": page_token}
+
+            r = requests.post(url, params=params, json=payload)
+            if r.status_code != 200:
+                print(f"Failed to send message: {r.status_code} - {r.text}")
+
+    return jsonify({"status": "ok"}), 200
 
 # ----- MAIN -----
 if __name__ == "__main__":
