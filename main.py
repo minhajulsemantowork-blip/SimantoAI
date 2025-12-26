@@ -1,13 +1,10 @@
 import os
 import json
 import requests
-from datetime import datetime
 import logging
-
 from flask import Flask, request
 from google import genai
 from langdetect import detect
-
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -27,16 +24,13 @@ try:
     logger.info(f"Firebase env var exists: {bool(FIREBASE_SERVICE_ACCOUNT)}")
     
     if FIREBASE_SERVICE_ACCOUNT:
-        # Parse the JSON string
         firebase_cred_json = json.loads(FIREBASE_SERVICE_ACCOUNT)
         cred = credentials.Certificate(firebase_cred_json)
         firebase_admin.initialize_app(cred)
         logger.info("✅ Firebase initialized successfully")
     else:
         logger.error("❌ FIREBASE_SERVICE_ACCOUNT environment variable not set")
-        # Fallback for local testing
-        cred = credentials.Certificate("service-account.json")
-        firebase_admin.initialize_app(cred)
+        raise ValueError("Firebase service account not configured")
 except Exception as e:
     logger.error(f"❌ Firebase init error: {str(e)}")
     raise
@@ -52,123 +46,84 @@ def get_client_id_by_page(page_id):
     try:
         logger.info(f"🔍 Searching client for page ID: {page_id}")
         
-        # Try different field paths
-        docs = db.collection("clients").where("integrations.facebook.pageId", "==", page_id).limit(1).get()
-        
-        if not docs:
-            # Try alternative path
-            docs = db.collection("clients").where("facebookPageId", "==", page_id).limit(1).get()
-        
-        if not docs:
-            # Try with integer conversion
-            try:
-                page_id_int = int(page_id)
-                docs = db.collection("clients").where("integrations.facebook.pageId", "==", page_id_int).limit(1).get()
-            except:
-                pass
+        # Query with correct field path
+        docs = db.collection("clients").where("integrations.facebook.pageId", "==", str(page_id)).limit(1).get()
         
         logger.info(f"📊 Found {len(docs)} matching documents")
         
         for doc in docs:
-            client_data = doc.to_dict()
             logger.info(f"✅ Client found: {doc.id}")
-            logger.debug(f"Client data: {json.dumps(client_data, indent=2, default=str)}")
             return doc.id
         
         logger.warning(f"❌ No client found for page ID: {page_id}")
-        
-        # List all clients for debugging
-        all_clients = db.collection("clients").limit(5).get()
-        logger.info(f"📋 First 5 clients in database:")
-        for client in all_clients:
-            client_data = client.to_dict()
-            logger.info(f"  Client ID: {client.id}")
-            logger.info(f"  Facebook data: {client_data.get('integrations', {}).get('facebook', {})}")
-        
         return None
         
     except Exception as e:
         logger.error(f"❌ Error in get_client_id_by_page: {str(e)}", exc_info=True)
         return None
 
-
 def get_facebook_token(client_id):
     """Get Facebook page access token for client"""
     try:
-        if not client_id:
-            logger.error("No client ID provided")
-            return None
-            
-        doc_ref = db.collection("clients").document(client_id)
-        doc = doc_ref.get()
+        logger.info(f"🔑 Getting Facebook token for client: {client_id}")
+        
+        doc = db.collection("clients").document(client_id).get()
         
         if not doc.exists:
-            logger.error(f"Client document {client_id} does not exist")
+            logger.error(f"❌ Client document {client_id} does not exist")
             return None
         
         client_data = doc.to_dict()
-        logger.debug(f"Client data for token: {json.dumps(client_data, indent=2, default=str)}")
         
-        # Try different possible paths
-        token = None
-        
-        # Path 1: integrations.facebook.pageAccessToken
+        # Get token from integrations.facebook.pageAccessToken
         if 'integrations' in client_data and 'facebook' in client_data['integrations']:
-            token = client_data['integrations']['facebook'].get('pageAccessToken')
-        
-        # Path 2: facebook.pageAccessToken
-        if not token and 'facebook' in client_data:
-            token = client_data['facebook'].get('pageAccessToken')
-        
-        # Path 3: direct field
-        if not token and 'pageAccessToken' in client_data:
-            token = client_data['pageAccessToken']
-        
-        if token:
-            logger.info(f"✅ Found Facebook token for client {client_id}")
-            logger.debug(f"Token (first 10 chars): {token[:10]}...")
-        else:
-            logger.error(f"❌ No Facebook token found for client {client_id}")
+            fb_data = client_data['integrations']['facebook']
+            token = fb_data.get('pageAccessToken')
             
-        return token
+            if token:
+                logger.info(f"✅ Found Facebook token (length: {len(token)})")
+                return token
+            else:
+                logger.error(f"❌ No pageAccessToken in Facebook data")
+        else:
+            logger.error(f"❌ No Facebook integration found")
+        
+        return None
         
     except Exception as e:
         logger.error(f"❌ Error in get_facebook_token: {str(e)}", exc_info=True)
         return None
 
-
 def get_gemini_key(client_id):
     """Get Gemini API key for client"""
     try:
+        logger.info(f"🔐 Getting Gemini key for client: {client_id}")
+        
         doc = db.collection("clients").document(client_id).get()
         if not doc.exists:
+            logger.error(f"❌ Client document {client_id} does not exist")
             return None
         
         client_data = doc.to_dict()
         
-        # Try different possible paths
-        gemini_key = None
-        
-        # Path 1: settings.apiKeys.geminiApiKey
-        if 'settings' in client_data and 'apiKeys' in client_data['settings']:
-            gemini_key = client_data['settings']['apiKeys'].get('geminiApiKey')
-        
-        # Path 2: direct field
-        if not gemini_key and 'geminiApiKey' in client_data:
-            gemini_key = client_data['geminiApiKey']
-        
-        if gemini_key:
-            logger.info(f"✅ Found Gemini key for client {client_id}")
-            logger.debug(f"Gemini key (first 10 chars): {gemini_key[:10]}...")
-        else:
-            logger.warning(f"⚠️ No Gemini key found for client {client_id}")
+        # Path: settings.apiKeys.geminiApiKey
+        if 'settings' in client_data:
+            settings = client_data['settings']
             
-        return gemini_key
+            if 'apiKeys' in settings:
+                api_keys = settings['apiKeys']
+                gemini_key = api_keys.get('geminiApiKey')
+                
+                if gemini_key:
+                    logger.info(f"✅ Found Gemini API key")
+                    return gemini_key
+        
+        logger.error(f"❌ No Gemini API key found for client {client_id}")
+        return None
         
     except Exception as e:
         logger.error(f"❌ Error in get_gemini_key: {str(e)}")
         return None
-
 
 def load_memory(client_id):
     """Load chat history from Firebase"""
@@ -187,7 +142,6 @@ def load_memory(client_id):
         logger.error(f"❌ Error loading memory: {str(e)}")
         return []
 
-
 def save_memory(client_id, history):
     """Save chat history to Firebase"""
     try:
@@ -196,7 +150,6 @@ def save_memory(client_id, history):
         logger.info(f"💾 Saved {len(history)} messages to history")
     except Exception as e:
         logger.error(f"❌ Error saving memory: {str(e)}")
-
 
 def send_facebook_message(page_token, sender_id, text):
     """Send message via Facebook Graph API"""
@@ -214,30 +167,27 @@ def send_facebook_message(page_token, sender_id, text):
         params = {"access_token": page_token}
         
         logger.info(f"📨 Sending message to {sender_id}")
-        logger.debug(f"Message text: {text}")
-        logger.debug(f"Token (first 10 chars): {page_token[:10]}...")
+        logger.debug(f"Message: {text[:50]}...")
         
         r = requests.post(url, params=params, json=payload, timeout=10)
         
         logger.info(f"📨 FB Response Status: {r.status_code}")
-        logger.debug(f"FB Response Text: {r.text}")
         
-        if r.status_code != 200:
+        if r.status_code == 200:
+            logger.info("✅ Message sent successfully")
+            return True
+        else:
             logger.error(f"❌ Failed to send message: {r.text}")
             return False
             
-        logger.info("✅ Message sent successfully")
-        return True
-        
     except Exception as e:
-        logger.error(f"❌ Error in send_facebook_message: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error in send_facebook_message: {str(e)}")
         return False
-
 
 def chat_with_gemini(client_id, user_text):
     """Generate response using Gemini"""
     try:
-        logger.info(f"🤖 Processing message for client {client_id}: {user_text}")
+        logger.info(f"🤖 Processing message: {user_text}")
         
         # Get history
         history = load_memory(client_id)
@@ -249,11 +199,10 @@ def chat_with_gemini(client_id, user_text):
             logger.info(f"🌐 Detected language: {language}")
         except:
             language = "en"
-            logger.warning("⚠️ Could not detect language, defaulting to English")
         
         # Prepare conversation context
         convo = ""
-        for h in history[-10:]:  # Last 10 messages
+        for h in history[-10:]:
             convo += f"User: {h['user']}\n{BOT_NAME}: {h['bot']}\n"
         convo += f"User: {user_text}\n{BOT_NAME}:"
         
@@ -279,11 +228,9 @@ Previous conversation:
 Now reply to the user naturally:
 """
         
-        logger.debug(f"📝 Prompt sent to Gemini: {prompt}")
-        
         # Generate response
         response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
+            model="gemini-1.5-flash",
             contents=prompt
         )
         
@@ -300,13 +247,11 @@ Now reply to the user naturally:
         logger.error(f"❌ Error in chat_with_gemini: {str(e)}", exc_info=True)
         return "দুঃখিত, কিছু সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।"
 
-
 # ================= ROUTES =================
 @app.route("/", methods=["GET"])
 def home():
     logger.info("🏠 Home page accessed")
     return "🤖 Simanto AI Bot is running!"
-
 
 # ---------- WEBHOOK VERIFY ----------
 @app.route("/webhook", methods=["GET"])
@@ -315,7 +260,7 @@ def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
     
-    logger.info(f"🔧 Webhook verification attempt - Mode: {mode}, Token: {token}")
+    logger.info(f"🔧 Webhook verification - Mode: {mode}, Token: {token}")
     
     if mode == "subscribe" and token:
         try:
@@ -326,7 +271,6 @@ def verify_webhook():
                 client_data = c.to_dict()
                 fb = client_data.get("integrations", {}).get("facebook", {})
                 stored_token = fb.get("verifyToken")
-                logger.info(f"Client {c.id}: verifyToken = {stored_token}")
                 
                 if stored_token == token:
                     logger.info(f"✅ Webhook verified for client: {c.id}")
@@ -336,11 +280,10 @@ def verify_webhook():
             return "Invalid verify token", 403
             
         except Exception as e:
-            logger.error(f"❌ Error during verification: {str(e)}", exc_info=True)
+            logger.error(f"❌ Error during verification: {str(e)}")
             return "Server error", 500
     
     return "Invalid request", 400
-
 
 # ---------- WEBHOOK POST ----------
 @app.route("/webhook", methods=["POST"])
@@ -348,149 +291,148 @@ def webhook():
     try:
         logger.info("📩 Webhook POST received")
         
-        # Get the JSON data
         data = request.get_json()
         if not data:
-            logger.error("❌ No JSON data received in webhook")
+            logger.error("❌ No JSON data received")
             return "No data", 400
         
-        logger.info("===== RAW WEBHOOK DATA =====")
-        logger.info(json.dumps(data, indent=2))
+        logger.debug(f"Webhook data: {json.dumps(data, indent=2)}")
         
         # Verify it's a page event
         if data.get("object") != "page":
-            logger.error("❌ Invalid object type, expected 'page'")
+            logger.error("❌ Invalid object type")
             return "Not a page event", 400
         
         # Process each entry
         for entry in data.get("entry", []):
-            page_id = entry.get("id")
-            logger.info(f"📄 Processing entry for Page ID: {page_id}")
-            
-            # Process messaging events
             for event in entry.get("messaging", []):
-                # Extract event data
                 sender_id = event.get("sender", {}).get("id")
                 recipient_id = event.get("recipient", {}).get("id")
-                timestamp = event.get("timestamp")
-                
-                logger.info(f"🕒 Event timestamp: {timestamp}")
-                logger.info(f"👤 Sender ID: {sender_id}")
-                logger.info(f"📱 Recipient ID: {recipient_id}")
-                
-                # Skip delivery/read receipts
-                if event.get("delivery") or event.get("read"):
-                    logger.info("📨 Delivery/Read receipt, skipping")
-                    continue
-                
-                # Check for message
                 message = event.get("message", {})
                 user_text = message.get("text")
                 
-                # Check for postback (button clicks)
+                # Check for postback
                 if not user_text and event.get("postback"):
-                    payload = event.get("postback", {}).get("payload")
-                    logger.info(f"🔄 Postback received: {payload}")
-                    user_text = payload
+                    user_text = event.get("postback", {}).get("payload")
                 
-                # Check for quick reply
-                if not user_text and message.get("quick_reply"):
-                    user_text = message.get("quick_reply", {}).get("payload")
+                logger.info(f"👤 Sender: {sender_id}")
+                logger.info(f"📱 Page: {recipient_id}")
+                logger.info(f"💬 Message: {user_text}")
                 
-                logger.info(f"💬 User message: {user_text}")
-                
-                # Validate required data
-                if not sender_id or not recipient_id:
-                    logger.error("⛔ Missing sender or recipient ID")
+                # Skip if no text
+                if not user_text or not sender_id or not recipient_id:
+                    logger.warning("⚠️ Skipping - missing data")
                     continue
                 
-                if not user_text:
-                    logger.warning("⚠️ No text message or payload, skipping")
-                    continue
-                
-                # Find client by page ID
+                # Find client
                 client_id = get_client_id_by_page(recipient_id)
                 if not client_id:
                     logger.error(f"❌ No client found for page: {recipient_id}")
-                    # Send a fallback message if possible
                     continue
                 
-                # Get Facebook page token
+                logger.info(f"✅ Client ID: {client_id}")
+                
+                # Get Facebook token
                 page_token = get_facebook_token(client_id)
                 if not page_token:
-                    logger.error(f"❌ No Facebook token for client: {client_id}")
+                    logger.error(f"❌ No Facebook token for client")
                     continue
                 
-                # Generate AI response
+                logger.info(f"✅ Got Facebook token")
+                
+                # Get AI response
                 reply = chat_with_gemini(client_id, user_text)
                 
-                # Send response back to Facebook
+                # Send response
                 success = send_facebook_message(page_token, sender_id, reply)
                 
                 if success:
-                    logger.info("✅ Message processing completed successfully")
+                    logger.info("✅ Message sent successfully")
                 else:
-                    logger.error("❌ Failed to send message to Facebook")
+                    logger.error("❌ Failed to send message")
         
-        logger.info("✅ Webhook processed successfully")
         return "EVENT_RECEIVED", 200
         
     except Exception as e:
         logger.error(f"🔥 Unexpected error in webhook: {str(e)}", exc_info=True)
         return "ERROR", 500
 
-
 # ================= DEBUG ROUTES =================
-@app.route("/debug/clients", methods=["GET"])
-def debug_clients():
-    """Debug endpoint to list all clients"""
+@app.route("/debug", methods=["GET"])
+def debug_info():
+    """Debug endpoint to check system status"""
     try:
-        clients = db.collection("clients").limit(20).get()
-        result = []
-        
-        for client in clients:
-            client_data = client.to_dict()
-            result.append({
-                "id": client.id,
-                "name": client_data.get("name", "No Name"),
-                "facebook": client_data.get("integrations", {}).get("facebook", {}),
-                "has_gemini_key": bool(get_gemini_key(client.id)),
-                "has_facebook_token": bool(get_facebook_token(client.id))
-            })
-        
-        return json.dumps({"clients": result}, indent=2, default=str)
-        
-    except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2), 500
-
-
-@app.route("/test/message", methods=["POST"])
-def test_message():
-    """Test endpoint to send a message"""
-    try:
-        data = request.get_json()
-        client_id = data.get("client_id")
-        user_text = data.get("message")
-        
-        if not client_id or not user_text:
-            return json.dumps({"error": "Missing client_id or message"}), 400
-        
-        reply = chat_with_gemini(client_id, user_text)
+        # Check Firebase
+        clients_count = len(list(db.collection("clients").limit(10).get()))
         
         return json.dumps({
-            "success": True,
-            "client_id": client_id,
-            "user_message": user_text,
-            "ai_reply": reply
+            "status": "running",
+            "bot_name": BOT_NAME,
+            "firebase": {
+                "connected": True,
+                "clients_count": clients_count
+            },
+            "endpoints": {
+                "webhook_verify": "/webhook [GET]",
+                "webhook_receive": "/webhook [POST]",
+                "home": "/ [GET]",
+                "debug": "/debug [GET]",
+                "check_client": "/check-client/<page_id> [GET]"
+            }
         }, indent=2)
-        
     except Exception as e:
         return json.dumps({"error": str(e)}, indent=2), 500
 
+@app.route("/check-client/<page_id>", methods=["GET"])
+def check_client(page_id):
+    """Check client data for a page"""
+    try:
+        client_id = get_client_id_by_page(page_id)
+        
+        if not client_id:
+            return json.dumps({
+                "success": False,
+                "message": f"No client found for page: {page_id}"
+            }, indent=2)
+        
+        # Get client data
+        doc = db.collection("clients").document(client_id).get()
+        client_data = doc.to_dict()
+        
+        # Extract relevant info
+        result = {
+            "success": True,
+            "page_id": page_id,
+            "client_id": client_id,
+            "has_facebook_token": bool(get_facebook_token(client_id)),
+            "has_gemini_key": bool(get_gemini_key(client_id)),
+            "data_structure": {
+                "keys": list(client_data.keys())
+            }
+        }
+        
+        # Add Facebook data if exists
+        if 'integrations' in client_data and 'facebook' in client_data['integrations']:
+            fb_data = client_data['integrations']['facebook']
+            result["facebook"] = {
+                "pageName": fb_data.get('pageName'),
+                "has_pageAccessToken": 'pageAccessToken' in fb_data,
+                "keys": list(fb_data.keys())
+            }
+        
+        # Add settings data if exists
+        if 'settings' in client_data:
+            result["settings"] = {
+                "keys": list(client_data['settings'].keys())
+            }
+        
+        return json.dumps(result, indent=2, default=str)
+        
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2), 500
 
 # ================= RUN =================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"🚀 Starting Simanto AI Bot on port {port}")
-    logger.info(f"🤖 Bot Name: {BOT_NAME}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    logger.info(f"🚀 Starting {BOT_NAME} AI Bot on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
