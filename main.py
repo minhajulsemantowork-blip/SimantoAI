@@ -394,6 +394,18 @@ def handle_webhook():
         return "ERROR", 500
 
 # ================= ADMIN/MONITORING ROUTES =================
+@app.route("/api/status", methods=["GET"])
+def system_status():
+    """System status (Multi-Tenant)"""
+    all_clients = get_all_clients()
+    
+    return json.dumps({
+        "status": "online",
+        "total_clients": len(all_clients),
+        "cache_size": len(_client_cache),
+        "timestamp": datetime.utcnow().isoformat()
+    }, indent=2)
+
 @app.route("/api/clients", methods=["GET"])
 def list_clients():
     """List all clients (Multi-Tenant)"""
@@ -478,17 +490,28 @@ def search_client_by_page(page_id):
             "message": "No client found with this page ID"
         }, indent=2), 404
 
-@app.route("/api/status", methods=["GET"])
-def system_status():
-    """System status (Multi-Tenant)"""
-    all_clients = get_all_clients()
-    
-    return json.dumps({
-        "status": "online",
-        "total_clients": len(all_clients),
-        "cache_size": len(_client_cache),
-        "timestamp": datetime.utcnow().isoformat()
-    }, indent=2)
+@app.route("/api/test-firebase", methods=["GET"])
+def test_firebase_connection():
+    """Test Firebase connection"""
+    try:
+        if not db:
+            return {"error": "Firebase not initialized"}, 500
+        
+        # Count total clients
+        clients = list(db.collection("clients").limit(5).get())
+        
+        # Try specific client
+        specific_doc = db.collection("clients").document("e6L1ttGY8pPundmDoZb2gqgjJaw2").get()
+        
+        return {
+            "firebase_connected": True,
+            "total_clients": len(clients),
+            "specific_client_exists": specific_doc.exists,
+            "clients_collection_exists": len(clients) > 0
+        }
+            
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}, 500
 
 # ================= APPLICATION START =================
 if __name__ == "__main__":
