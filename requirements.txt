@@ -1,5 +1,5 @@
 Flask==3.1.2
-firebase_admin==7.1.0
+supabase==2.3.0
 google-genai==1.52.0
 langdetect==1.0.9
 python-dotenv==0.21.1
