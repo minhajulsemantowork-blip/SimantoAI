@@ -1,5 +1,5 @@
 Flask==3.1.2
-supabase==3.11.1
+supabase==2.27.0
 google-genai==1.52.0
 langdetect==1.0.9
 python-dotenv==0.21.1
