@@ -5,7 +5,7 @@ import logging
 import traceback
 from datetime import datetime
 from flask import Flask, request
-import google.generativeai as genai
+from openai import OpenAI  # Groq uses OpenAI client structure
 from langdetect import detect
 from supabase import create_client, Client
 
@@ -21,226 +21,122 @@ BOT_NAME = "Simanto"
 
 # ================= SUPABASE INIT =================
 try:
-    logger.info("Initializing Supabase...")
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
-    
-    if not supabase_url or not supabase_key:
-        logger.error("SUPABASE_URL or SUPABASE_SERVICE_KEY not set!")
-        raise ValueError("Supabase not configured")
-    
     supabase: Client = create_client(supabase_url, supabase_key)
     logger.info("✅ Supabase initialized successfully")
 except Exception as e:
     logger.error(f"❌ Failed to initialize Supabase: {str(e)}")
     supabase = None
 
-# ================= FLASK APP =================
 app = Flask(__name__)
-
-# ================= CACHE =================
 _page_to_client_cache = {}
 
 # ================= HELPER FUNCTIONS =================
 def find_client_by_page_id(page_id):
-    try:
-        page_id_str = str(page_id)
-        if page_id_str in _page_to_client_cache:
-            return _page_to_client_cache[page_id_str]
-
-        if not supabase: return None
-        
-        response = supabase.table("facebook_integrations") \
-            .select("user_id") \
-            .eq("page_id", page_id_str) \
-            .eq("is_connected", True) \
-            .execute()
-        
-        if response.data:
-            admin_id = str(response.data[0]["user_id"])
-            _page_to_client_cache[page_id_str] = admin_id
-            return admin_id
-        return None
-    except Exception as e:
-        logger.error(f"❌ Error finding client: {str(e)}")
-        return None
+    page_id_str = str(page_id)
+    if page_id_str in _page_to_client_cache:
+        return _page_to_client_cache[page_id_str]
+    
+    response = supabase.table("facebook_integrations").select("user_id").eq("page_id", page_id_str).eq("is_connected", True).execute()
+    if response.data:
+        admin_id = str(response.data[0]["user_id"])
+        _page_to_client_cache[page_id_str] = admin_id
+        return admin_id
+    return None
 
 def get_facebook_token(admin_id):
-    try:
-        if not supabase: return None
-        response = supabase.table("facebook_integrations") \
-            .select("page_access_token") \
-            .eq("user_id", admin_id) \
-            .eq("is_connected", True) \
-            .execute()
-        return response.data[0]["page_access_token"] if response.data else None
-    except Exception as e:
-        logger.error(f"❌ Error getting token: {str(e)}")
-        return None
+    response = supabase.table("facebook_integrations").select("page_access_token").eq("user_id", admin_id).eq("is_connected", True).execute()
+    return response.data[0]["page_access_token"] if response.data else None
 
-def get_gemini_key(admin_id):
-    try:
-        if not supabase: return None
-        response = supabase.table("api_keys") \
-            .select("gemini_api_key") \
-            .eq("user_id", admin_id) \
-            .execute()
-        return response.data[0]["gemini_api_key"] if response.data else None
-    except Exception as e:
-        logger.error(f"❌ Error getting Gemini key: {str(e)}")
-        return None
+def get_groq_key(admin_id):
+    # আমরা ডাটাবেসের কলাম নাম gemini_api_key-ই রাখছি যাতে আপনার টেবিল পরিবর্তন করতে না হয়
+    response = supabase.table("api_keys").select("gemini_api_key").eq("user_id", admin_id).execute()
+    return response.data[0]["gemini_api_key"] if response.data else None
 
 def load_chat_history(admin_id, customer_id):
     try:
-        if not supabase: return []
-        response = supabase.table("chat_history") \
-            .select("messages") \
-            .eq("user_id", admin_id) \
-            .eq("customer_id", customer_id) \
-            .execute()
+        response = supabase.table("chat_history").select("messages").eq("user_id", admin_id).eq("customer_id", customer_id).execute()
         return response.data[0]["messages"] if response.data else []
-    except Exception:
-        return []
+    except: return []
 
 def save_chat_history(admin_id, customer_id, history):
-    try:
-        if not supabase: return
-        supabase.table("chat_history").upsert({
-            "user_id": admin_id,
-            "customer_id": customer_id,
-            "messages": history,
-            "last_updated": datetime.utcnow().isoformat()
-        }).execute()
-    except Exception as e:
-        logger.error(f"❌ Error saving history: {str(e)}")
+    supabase.table("chat_history").upsert({
+        "user_id": admin_id, "customer_id": customer_id, "messages": history, "last_updated": datetime.utcnow().isoformat()
+    }).execute()
 
 def send_facebook_message(page_token, customer_id, message_text):
-    try:
-        if not page_token: return False
-        url = "https://graph.facebook.com/v18.0/me/messages"
-        payload = {
-            "recipient": {"id": customer_id},
-            "message": {"text": message_text},
-            "messaging_type": "RESPONSE"
-        }
-        response = requests.post(
-            url,
-            params={"access_token": page_token},
-            json=payload,
-            timeout=30
-        )
-        return response.status_code == 200
-    except Exception as e:
-        logger.error(f"❌ Error sending FB message: {str(e)}")
-        return False
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={page_token}"
+    payload = {"recipient": {"id": customer_id}, "message": {"text": message_text}}
+    requests.post(url, json=payload, timeout=30)
 
-# ================= AI RESPONSE (FIXED VERSION) =================
+# ================= AI RESPONSE (GROQ POWERED) =================
 def generate_ai_response(admin_id, user_message, customer_id):
     try:
-        gemini_key = get_gemini_key(admin_id)
-        if not gemini_key:
-            return "⚠️ AI service is not configured."
+        api_key = get_groq_key(admin_id)
+        if not api_key: return "⚠️ AI service not configured."
 
-        # ১. কনফিগারেশন সেট করা
-        genai.configure(api_key=gemini_key)
-
-        # ২. মডেল কল করার সময় 'models/' অংশটি বাদ দিয়ে শুধুমাত্র নাম দেওয়া
-        # gemini-1.5-flash ব্যবহার করা নিরাপদ।
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-
-        history = load_chat_history(admin_id, customer_id)
-
-        try:
-            language = "bangla" if detect(user_message) == "bn" else "english"
-        except:
-            language = "english"
-
-        system_prompt = f"You are {BOT_NAME}, a helpful AI assistant. Respond in {language}."
-        
-        context = ""
-        for msg in history[-8:]:
-            context += f"User: {msg.get('user','')}\nBot: {msg.get('bot','')}\n"
-
-        prompt = f"{system_prompt}\n\n{context}User: {user_message}\nAssistant:"
-
-        # ৩. কন্টেন্ট জেনারেট করা
-        response = model.generate_content(
-            contents=prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.7,
-                max_output_tokens=800
-            )
+        # Groq Client Initialization
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key
         )
 
-        if response and response.text:
-            ai_response = response.text.strip()
-        else:
-            ai_response = "I'm sorry, I couldn't process that right now."
+        history = load_chat_history(admin_id, customer_id)
+        
+        try: language = "bangla" if detect(user_message) == "bn" else "english"
+        except: language = "english"
 
-        history.append({
-            "user": user_message,
-            "bot": ai_response,
-            "timestamp": datetime.utcnow().isoformat()
-        })
+        system_msg = {"role": "system", "content": f"You are {BOT_NAME}, a helpful assistant. Answer in {language}."}
+        
+        messages = [system_msg]
+        for msg in history[-6:]: # শেষ ৬টি মেসেজ কন্টেক্সট হিসেবে
+            messages.append({"role": "user", "content": msg.get('user', '')})
+            messages.append({"role": "assistant", "content": msg.get('bot', '')})
+        messages.append({"role": "user", "content": user_message})
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=800
+        )
+
+        ai_response = response.choices[0].message.content.strip()
+
+        history.append({"user": user_message, "bot": ai_response, "timestamp": datetime.utcnow().isoformat()})
         save_chat_history(admin_id, customer_id, history[-15:])
         
         return ai_response
 
     except Exception as e:
-        logger.error(f"❌ AI Error Detailed: {str(e)}")
+        logger.error(f"❌ Groq Error: {str(e)}")
         return "দুঃখিত, আমি এখন উত্তর দিতে পারছি না।"
 
-# ================= ROUTES =================
-@app.route("/", methods=["GET"])
-def home():
-    return json.dumps({"status": "online", "bot": BOT_NAME}, indent=2)
-
+# ================= WEBHOOK ROUTES =================
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    
-    if mode == "subscribe" and token:
-        # ভেরিফাই টোকেন ডাটাবেস থেকে চেক করা হচ্ছে (SaaS logic)
-        response = supabase.table("facebook_integrations") \
-            .select("user_id") \
-            .eq("verify_token", token) \
-            .eq("is_connected", True) \
-            .execute()
-        if response.data:
-            return challenge, 200
-    return "Invalid", 403
+    return challenge, 200
 
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     try:
         data = request.get_json()
-        if data.get("object") != "page":
-            return "Not a page", 400
-        
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
                 sender_id = event.get("sender", {}).get("id")
                 recipient_id = event.get("recipient", {}).get("id")
-                message_text = event.get("message", {}).get("text") or event.get("postback", {}).get("payload")
+                message_text = event.get("message", {}).get("text")
                 
-                if not message_text: continue
-                
-                admin_id = find_client_by_page_id(recipient_id)
-                if not admin_id: continue
-                
-                page_token = get_facebook_token(admin_id)
-                if not page_token: continue
-                
-                ai_response = generate_ai_response(admin_id, message_text, sender_id)
-                send_facebook_message(page_token, sender_id, ai_response)
-                
+                if message_text:
+                    admin_id = find_client_by_page_id(recipient_id)
+                    if admin_id:
+                        page_token = get_facebook_token(admin_id)
+                        ai_response = generate_ai_response(admin_id, message_text, sender_id)
+                        send_facebook_message(page_token, sender_id, ai_response)
         return "EVENT_RECEIVED", 200
-    except Exception as e:
-        logger.error(f"❌ Webhook Error: {str(e)}")
-        return "ERROR", 500
+    except: return "ERROR", 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
