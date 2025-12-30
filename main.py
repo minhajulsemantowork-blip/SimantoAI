@@ -125,10 +125,11 @@ def get_all_products_formatted(admin_id: str) -> str:
     in_stock_products = []
     for product in products:
         if product.get("in_stock", False) and product.get("stock", 0) > 0:
-            name = product.get("name", "")
+            name = product.get("name", "").strip()
             price = product.get("price", 0)
             stock = product.get("stock", 0)
-            in_stock_products.append(f"• {name} - ৳{price:,} (স্টক: {stock})")
+            if name:  # Ensure product name is not empty
+                in_stock_products.append(f"• {name} - ৳{price:,} (স্টক: {stock})")
     
     if not in_stock_products:
         return "দুঃখিত, এখন স্টকে কোনো পণ্য নেই। দয়া করে কিছুক্ষণ পরে চেষ্টা করুন।"
@@ -139,7 +140,7 @@ def get_all_products_formatted(admin_id: str) -> str:
     if len(in_stock_products) > 8:
         response += f"\n\n... আরও {len(in_stock_products) - 8}টি পণ্য স্টকে আছে"
     
-    response += "\n\n🔍 নির্দিষ্ট পণ্যের দাম জানতে নাম লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন"
+    response += "\n\n🔍 নির্দিষ্ট পণ্যের দাম জানতে পণ্যের নাম লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন\n📞 আরও তথ্যের জন্য আমাদের কল করুন"
     return response
 
 def check_price_query(text: str, products: List[Dict]) -> Tuple[bool, Optional[str]]:
@@ -151,8 +152,8 @@ def check_price_query(text: str, products: List[Dict]) -> Tuple[bool, Optional[s
     if any(keyword in text_lower for keyword in price_keywords):
         # Check if specific product is mentioned
         for product in products:
-            product_name = product.get("name", "").lower()
-            if product_name in text_lower:
+            product_name = product.get("name", "").lower().strip()
+            if product_name and product_name in text_lower:
                 price = product.get("price", 0)
                 stock = product.get("stock", 0)
                 in_stock = product.get("in_stock", False)
@@ -169,11 +170,14 @@ def check_price_query(text: str, products: List[Dict]) -> Tuple[bool, Optional[s
 
 def find_product_in_query(text: str, products: List[Dict]) -> Optional[Dict]:
     """কোয়েরিতে পণ্য খুঁজে বের করো"""
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
     
     for product in products:
-        product_name = product.get("name", "").lower()
+        product_name = product.get("name", "").lower().strip()
         
+        if not product_name:
+            continue
+            
         # Exact match
         if product_name in text_lower:
             return product
@@ -218,7 +222,7 @@ class OrderSession:
         if self.step == 1:  # Name
             self.data["name"] = user_message.strip()
             self.step = 2
-            return "ধন্যবাদ! এখন আপনার ফোন নম্বর দিন:", False
+            return "ধন্যবাদ! এখন আপনার ফোন নম্বর দিন (যেমন: 017XXXXXXXX):", False
             
         elif self.step == 2:  # Phone
             phone = user_message.strip()
@@ -226,9 +230,9 @@ class OrderSession:
                 self.data["phone"] = phone
                 self.step = 3
                 products_text = self.get_available_products()
-                return f"ফোন নম্বর সংরক্ষিত! কোন পণ্য অর্ডার করতে চান?\n\n{products_text}", False
+                return f"ফোন নম্বর সংরক্ষিত! কোন পণ্য অর্ডার করতে চান?\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
             else:
-                return "দুঃখিত, সঠিক ফোন নম্বর দিন (যেমন: 01XXXXXXXXX):", False
+                return "দুঃখিত, সঠিক ফোন নম্বর দিন (যেমন: 017XXXXXXXX):", False
                 
         elif self.step == 3:  # Product
             selected_product = self.find_product(user_message)
@@ -241,7 +245,7 @@ class OrderSession:
                 return f"{selected_product['name']} নির্বাচিত! (৳{price:,})\n\nকত পিস চান? (স্টকে আছে: {stock} পিস):", False
             else:
                 products_text = self.get_available_products()
-                return f"পণ্যটি খুঁজে পাইনি। আবার চেষ্টা করুন:\n\n{products_text}", False
+                return f"পণ্যটি খুঁজে পাইনি। আবার চেষ্টা করুন:\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
                 
         elif self.step == 4:  # Quantity
             if user_message.isdigit():
@@ -255,7 +259,7 @@ class OrderSession:
                             price = product.get("price", 0)
                             self.data["total"] = price * quantity
                             self.step = 5
-                            return f"{quantity} পিস নির্বাচিত! মোট মূল্য: ৳{self.data['total']:,}\n\nএখন আপনার ডেলিভারি ঠিকানা দিন:", False
+                            return f"{quantity} পিস নির্বাচিত! মোট মূল্য: ৳{self.data['total']:,}\n\nএখন আপনার ডেলিভারি ঠিকানা দিন (বিস্তারিত):", False
                         else:
                             return f"দুঃখিত, স্টকে মাত্র {stock} পিস আছে। কম সংখ্যক দিন:", False
                 else:
@@ -267,23 +271,24 @@ class OrderSession:
             self.data["address"] = user_message.strip()
             self.step = 6
             summary = self.get_order_summary()
-            return f"ঠিকানা সংরক্ষিত!\n\n{summary}\n\nঅর্ডার কনফার্ম করতে 'হ্যাঁ' লিখুন:", False
+            return f"ঠিকানা সংরক্ষিত!\n\n{summary}\n\nঅর্ডার কনফার্ম করতে শুধুমাত্র 'confirm' লিখুন।\nঅন্য কিছু লিখলে অর্ডার বাতিল হবে।", False
             
         elif self.step == 6:  # Confirm
-            response_lower = user_message.lower()
-            if response_lower in ['হ্যাঁ', 'yes', 'y', 'ok', 'ঠিক আছে', 'confirm', 'কনফার্ম']:
+            response_lower = user_message.lower().strip()
+            # শুধুমাত্র 'confirm' লিখলেই অর্ডার কনফার্ম হবে
+            if response_lower == 'confirm':
                 order_saved = self.save_order()
                 if order_saved:
                     completed = True
                     order_id = self.data.get("order_id", "")
-                    return f"✅ অর্ডার সফলভাবে কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: {order_id}\n\nআমরা শীঘ্রই আপনার সাথে যোগাযোগ করব। ধন্যবাদ! 😊", True
+                    return f"✅ অর্ডার সফলভাবে কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: {order_id}\n\nআমরা শীঘ্রই আপনার সাথে যোগাযোগ করব। ধন্যবাদ! 😊\n\nঅন্যান্য পণ্য দেখতে যেকোনো মেসেজ দিন।", True
                 else:
-                    return "❌ অর্ডার সেভ করতে সমস্যা হয়েছে।", True
+                    return "❌ অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।", True
             else:
                 completed = True
-                return "অর্ডার বাতিল হয়েছে।", True
+                return "অর্ডার বাতিল হয়েছে। আবার অর্ডার দিতে 'অর্ডার' লিখুন।", True
         
-        return "কিছু সমস্যা হয়েছে।", True
+        return "কিছু সমস্যা হয়েছে। আবার চেষ্টা করুন।", True
     
     def validate_phone(self, phone: str) -> bool:
         """Validate phone number"""
@@ -295,9 +300,11 @@ class OrderSession:
         available = []
         for product in self.products:
             if product.get("in_stock", False) and product.get("stock", 0) > 0:
-                price = product.get("price", 0)
-                stock = product.get("stock", 0)
-                available.append(f"- {product['name']} (৳{price:,}, স্টক: {stock})")
+                name = product.get("name", "").strip()
+                if name:  # Check if name is not empty
+                    price = product.get("price", 0)
+                    stock = product.get("stock", 0)
+                    available.append(f"- {name} (৳{price:,}, স্টক: {stock})")
         
         if available:
             return "স্টকে থাকা পণ্য:\n" + "\n".join(available[:6])
@@ -311,7 +318,8 @@ class OrderSession:
         query_lower = query.lower().strip()
         
         for product in self.products:
-            if query_lower in product.get("name", "").lower():
+            name = product.get("name", "").lower().strip()
+            if name and query_lower in name:
                 if product.get("in_stock", False) and product.get("stock", 0) > 0:
                     return product
         
@@ -320,7 +328,7 @@ class OrderSession:
     def find_product_by_name(self, name: str) -> Optional[Dict]:
         """Find product by name"""
         for product in self.products:
-            if product.get("name", "").lower() == name.lower():
+            if product.get("name", "").lower().strip() == name.lower().strip():
                 return product
         return None
     
@@ -558,14 +566,14 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
             
             if language == "bangla":
                 if in_stock and stock > 0:
-                    return f"{product['name']} এর দাম ৳{price:,}। স্টকে আছে {stock} পিস।\n\nঅর্ডার দিতে 'অর্ডার' লিখুন।"
+                    return f"{product['name']} এর দাম ৳{price:,}। স্টকে আছে {stock} পিস।\n\nঅর্ডার দিতে 'অর্ডার' লিখুন।\nআরও তথ্যের জন্য আমাদের কল করুন।\nঅন্যান্য পণ্য দেখতে পণ্যের নাম লিখুন।"
                 else:
-                    return f"{product['name']} এর দাম ৳{price:,}। কিন্তু এখন স্টকে নেই।"
+                    return f"{product['name']} এর দাম ৳{price:,}। কিন্তু এখন স্টকে নেই।\n\nঅন্যান্য পণ্য দেখতে পণ্যের নাম লিখুন।"
             else:
                 if in_stock and stock > 0:
-                    return f"{product['name']} price is ৳{price:,}. Stock: {stock} pieces.\n\nType 'order' to purchase."
+                    return f"{product['name']} price is ৳{price:,}. Stock: {stock} pieces.\n\nType 'order' to purchase.\nCall us for more information.\nType product name for other products."
                 else:
-                    return f"{product['name']} price is ৳{price:,}. Currently out of stock."
+                    return f"{product['name']} price is ৳{price:,}. Currently out of stock.\n\nType product name for other products."
         
         # Check order request
         if check_order_keywords(user_message):
@@ -575,7 +583,7 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
         # Normal AI response
         api_key = get_groq_key(admin_id)
         if not api_key:
-            return "দুঃখিত, সেবা সাময়িকভাবে বন্ধ আছে।"
+            return "দুঃখিত, সেবা সাময়িকভাবে বন্ধ আছে। দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।"
         
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
         
@@ -586,10 +594,12 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
         if language == 'bangla':
             system_prompt = f"""তুমি {BOT_NAME}, {page_name}-এর সহকারী।
 
+নিয়মাবলী:
 ১. বন্ধুত্বপূর্ণ ও সহায়ক হও
 ২. পণ্যের দাম ও স্টক জানালে বলো
 ৩. অর্ডার নিতে সাহায্য করো
-৪. সংক্ষিপ্ত উত্তর দাও
+৪. ৪-৫ লাইনের মধ্যে উত্তর দাও
+৫. সংক্ষিপ্ত কিন্তু পূর্ণাঙ্গ উত্তর দাও
 
 মোট পণ্য: {total_products}টি (স্টকে: {in_stock_count}টি)
 
@@ -598,10 +608,12 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
         else:
             system_prompt = f"""You are {BOT_NAME}, assistant of {page_name}.
 
+Rules:
 1. Be friendly and helpful
 2. Provide product prices and stock
 3. Help with orders
-4. Keep answers short
+4. Give answers in 4-5 lines
+5. Keep answers short but complete
 
 Total products: {total_products} (In stock: {in_stock_count})
 
@@ -615,7 +627,7 @@ You:"""
             model="llama-3.3-70b-versatile",
             messages=messages,
             temperature=0.7,
-            max_tokens=100,
+            max_tokens=250,  # Increased from 100 to 250 for longer responses
             top_p=0.9
         )
         
@@ -624,7 +636,7 @@ You:"""
         
     except Exception as e:
         logger.error(f"AI Response Error: {str(e)}")
-        return "দুঃখিত, সমস্যা হয়েছে। আবার চেষ্টা করুন।"
+        return "দুঃখিত, সমস্যা হয়েছে। আবার চেষ্টা করুন। আমাদের কল করুন সরাসরি কথা বলতে।"
 
 # ================= WEBHOOK ROUTES =================
 @app.route("/webhook", methods=["GET"])
