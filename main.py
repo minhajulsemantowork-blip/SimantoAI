@@ -40,6 +40,8 @@ _page_to_client_cache = {}
 _product_cache = {}
 _order_sessions = {}  # Store order collection sessions
 _first_message_cache = {}  # Track first messages
+_category_sessions = {}  # Track category browsing sessions
+_product_browsing_sessions = {}  # Track product browsing sessions
 
 # ================= HELPER FUNCTIONS =================
 def is_first_message(admin_id: str, customer_id: str) -> bool:
@@ -83,10 +85,10 @@ def get_welcome_response(page_name: str, language: str = "bangla") -> str:
     
     if language == "bangla":
         greeting = random.choice(greetings_bangla)
-        return f"{greeting}\n\n{page_name}-এ আপনাকে স্বাগতম! আমি {BOT_NAME}, আপনার সহায়ক।\n\nকিভাবে সাহায্য করতে পারি?"
+        return f"{greeting}\n\n{page_name}-এ আপনাকে স্বাগতম! আমি {BOT_NAME}, আপনার সহায়ক।\n\nকিভাবে সাহায্য করতে পারি?\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন\nঅর্ডার দিতে 'অর্ডার' লিখুন"
     else:
         greeting = random.choice(greetings_english)
-        return f"{greeting}\n\nWelcome to {page_name}! I'm {BOT_NAME}, your assistant.\n\nHow can I help you today?"
+        return f"{greeting}\n\nWelcome to {page_name}! I'm {BOT_NAME}, your assistant.\n\nHow can I help you today?\n\nType 'category' to see categories\nType 'products' to see all products\nType 'order' to place order"
 
 def handle_greeting_message(user_message: str, page_name: str, language: str) -> Optional[str]:
     """গ্রিটিং মেসেজ handle করো"""
@@ -98,25 +100,63 @@ def handle_greeting_message(user_message: str, page_name: str, language: str) ->
     if language == "bangla":
         if any(greet in message_lower for greet in greetings_bangla):
             responses = [
-                f"আসসালামু আলাইকুম! 😊 {page_name}-এ আপনাকে স্বাগতম! কিভাবে সাহায্য করতে পারি?",
-                f"হ্যালো! 😊 {page_name}-এর পণ্য সম্পর্কে জানতে চান?",
-                f"নমস্কার! 😊 আমি {BOT_NAME}, আপনার সহায়ক। কিভাবে সাহায্য করতে পারি?"
+                f"আসসালামু আলাইকুম! 😊 {page_name}-এ আপনাকে স্বাগতম!\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন\nঅর্ডার দিতে 'অর্ডার' লিখুন",
+                f"হ্যালো! 😊 {page_name}-এর পণ্য সম্পর্কে জানতে চান?\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন\nঅর্ডার দিতে 'অর্ডার' লিখুন",
+                f"নমস্কার! 😊 আমি {BOT_NAME}, আপনার সহায়ক।\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন\nঅর্ডার দিতে 'অর্ডার' লিখুন"
             ]
             return random.choice(responses)
     else:
         if any(greet in message_lower for greet in greetings_english):
             responses = [
-                f"Hello! 😊 Welcome to {page_name}! How can I assist you today?",
-                f"Hi there! 😊 I'm {BOT_NAME} from {page_name}. How can I help?",
-                f"Greetings! 😊 Welcome to our page. What can I do for you?"
+                f"Hello! 😊 Welcome to {page_name}!\n\nType 'category' to see categories\nType 'products' to see all products\nType 'order' to place order",
+                f"Hi there! 😊 I'm {BOT_NAME} from {page_name}.\n\nType 'category' to see categories\nType 'products' to see all products\nType 'order' to place order",
+                f"Greetings! 😊 Welcome to our page.\n\nType 'category' to see categories\nType 'products' to see all products\nType 'order' to place order"
             ]
             return random.choice(responses)
     
     return None
 
+def get_products_with_details(admin_id: str) -> List[Dict]:
+    """সকল প্রোডাক্টের বিস্তারিত তথ্য নিয়ে আসো"""
+    products = get_products(admin_id)
+    
+    if not products:
+        return []
+    
+    detailed_products = []
+    for product in products:
+        detailed_products.append({
+            "id": product.get("id"),
+            "name": product.get("name", "").strip(),
+            "price": product.get("price", 0),
+            "stock": product.get("stock", 0),
+            "in_stock": product.get("in_stock", False),
+            "description": product.get("description", "কোনো বিবরণ নেই।").strip(),
+            "category": product.get("category", "সাধারণ").strip(),
+            "features": product.get("features", "").strip() or "উচ্চমানের উপকরণ, টেকসই ও নির্ভরযোগ্য",
+            "benefits": product.get("benefits", "").strip() or "দীর্ঘস্থায়ী ব্যবহার, মানসম্মত ও সাশ্রয়ী"
+        })
+    
+    return detailed_products
+
+def get_all_categories(admin_id: str) -> List[str]:
+    """সকল ক্যাটাগরি লিস্ট করো"""
+    products = get_products_with_details(admin_id)
+    
+    if not products:
+        return []
+    
+    categories = set()
+    for product in products:
+        category = product.get("category", "").strip()
+        if category:
+            categories.add(category)
+    
+    return sorted(list(categories))
+
 def get_all_products_formatted(admin_id: str) -> str:
     """সকল প্রোডাক্টের লিস্ট ফরম্যাট করে রিটার্ন করো"""
-    products = get_products(admin_id)
+    products = get_products_with_details(admin_id)
     
     if not products:
         return "দুঃখিত, এখন কোনো পণ্য পাওয়া যাচ্ছে না।"
@@ -125,23 +165,131 @@ def get_all_products_formatted(admin_id: str) -> str:
     in_stock_products = []
     for product in products:
         if product.get("in_stock", False) and product.get("stock", 0) > 0:
-            name = product.get("name", "").strip()
+            name = product.get("name", "")
             price = product.get("price", 0)
             stock = product.get("stock", 0)
+            description = product.get("description", "")
             if name:  # Ensure product name is not empty
-                in_stock_products.append(f"• {name} - ৳{price:,} (স্টক: {stock})")
+                in_stock_products.append(f"• {name} - ৳{price:,} (স্টক: {stock})\n   📝 {description[:80]}...")
     
     if not in_stock_products:
         return "দুঃখিত, এখন স্টকে কোনো পণ্য নেই। দয়া করে কিছুক্ষণ পরে চেষ্টা করুন।"
     
     response = "🛒 **স্টকে থাকা পণ্য:**\n\n"
-    response += "\n".join(in_stock_products[:8])  # Show max 8 products
+    response += "\n\n".join(in_stock_products[:6])  # Show max 6 products with descriptions
     
-    if len(in_stock_products) > 8:
-        response += f"\n\n... আরও {len(in_stock_products) - 8}টি পণ্য স্টকে আছে"
+    if len(in_stock_products) > 6:
+        response += f"\n\n... আরও {len(in_stock_products) - 6}টি পণ্য স্টকে আছে"
     
-    response += "\n\n🔍 নির্দিষ্ট পণ্যের দাম জানতে পণ্যের নাম লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন\n📞 আরও তথ্যের জন্য আমাদের কল করুন"
+    response += "\n\n🔍 নির্দিষ্ট পণ্যের বিস্তারিত জানতে পণ্যের নাম লিখুন\n📂 ক্যাটাগরি অনুযায়ী দেখতে 'ক্যাটাগরি' লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন"
     return response
+
+def show_categories(admin_id: str, customer_id: str) -> str:
+    """ক্যাটাগরি দেখাও"""
+    categories = get_all_categories(admin_id)
+    
+    if not categories:
+        return "দুঃখিত, এখন কোনো ক্যাটাগরি পাওয়া যাচ্ছে না।"
+    
+    response = "📂 **ক্যাটাগরি তালিকা:**\n\n"
+    for i, category in enumerate(categories[:10], 1):  # Max 10 categories
+        response += f"{i}. {category}\n"
+    
+    response += "\nকোন ক্যাটাগরির পণ্য দেখতে চান? ক্যাটাগরির নাম লিখুন।"
+    
+    # Start category browsing session
+    _category_sessions[f"cat_{admin_id}_{customer_id}"] = {
+        "categories": categories,
+        "step": "waiting_for_category"
+    }
+    
+    return response
+
+def show_products_by_category(admin_id: str, customer_id: str, category_name: str) -> str:
+    """নির্দিষ্ট ক্যাটাগরির পণ্য দেখাও"""
+    products = get_products_with_details(admin_id)
+    
+    if not products:
+        return "দুঃখিত, এখন কোনো পণ্য পাওয়া যাচ্ছে না।"
+    
+    # Filter products by category
+    category_products = []
+    for product in products:
+        if product.get("category", "").strip().lower() == category_name.lower():
+            if product.get("in_stock", False) and product.get("stock", 0) > 0:
+                category_products.append(product)
+    
+    if not category_products:
+        return f"দুঃখিত, '{category_name}' ক্যাটাগরিতে এখন কোনো পণ্য স্টকে নেই।\n\nঅন্য ক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন।"
+    
+    response = f"🛍️ **{category_name} ক্যাটাগরির পণ্য:**\n\n"
+    
+    for i, product in enumerate(category_products[:8], 1):  # Max 8 products per category
+        name = product.get("name", "")
+        price = product.get("price", 0)
+        stock = product.get("stock", 0)
+        description = product.get("description", "")[:60]
+        response += f"{i}. {name} - ৳{price:,} (স্টক: {stock})\n   {description}...\n\n"
+    
+    response += "কোন পণ্যের বিস্তারিত জানতে চান? পণ্যের নাম বা নম্বর লিখুন।\n\n"
+    response += "🔙 অন্য ক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন"
+    
+    # Start product browsing session
+    _product_browsing_sessions[f"prod_{admin_id}_{customer_id}"] = {
+        "category": category_name,
+        "products": category_products,
+        "step": "waiting_for_product"
+    }
+    
+    return response
+
+def get_product_details_response(product: Dict) -> str:
+    """পণ্যের আকর্ষণীয় বিবরণ দাও"""
+    name = product.get("name", "")
+    price = product.get("price", 0)
+    stock = product.get("stock", 0)
+    in_stock = product.get("in_stock", False)
+    description = product.get("description", "উচ্চমানের পণ্য")
+    category = product.get("category", "সাধারণ")
+    features = product.get("features", "উচ্চমানের উপকরণ, টেকসই নির্মাণ")
+    benefits = product.get("benefits", "দীর্ঘস্থায়ী ব্যবহার, মানসম্মত ও সাশ্রয়ী")
+    
+    # Create attractive description based on available info
+    attractive_lines = [
+        f"✨ **{name}** ✨\n",
+        f"🏷️ ক্যাটাগরি: {category}\n",
+        f"💰 বিশেষ দাম: ৳{price:,}\n",
+        f"📦 উপলব্ধতা: {'✅ স্টকে আছে' if in_stock and stock > 0 else '⏳ শীঘ্রই আসছে'}\n"
+    ]
+    
+    if in_stock and stock > 0:
+        attractive_lines.append(f"📊 স্টক অবস্থা: {stock} পিস\n")
+    
+    attractive_lines.append(f"\n📝 **পণ্যের বিবরণ:**\n{description}\n")
+    
+    attractive_lines.append(f"\n🌟 **বিশেষ বৈশিষ্ট্য:**\n{features}\n")
+    
+    attractive_lines.append(f"\n🎯 **আপনার সুবিধা:**\n{benefits}\n")
+    
+    # Add some motivational lines
+    motivational = [
+        "\n💎 **কেন এই পণ্য কিনবেন?**",
+        "✅ ১০০% অরিজিনাল ও গ্যারান্টিযুক্ত",
+        "✅ হোম ডেলিভারি সার্ভিস উপলব্ধ",
+        "✅ সহজ পেমেন্ট সিস্টেম",
+        "✅ ৭ দিনের রিটার্ন পলিসি"
+    ]
+    
+    attractive_lines.extend(motivational)
+    
+    attractive_lines.append(f"\n🛒 **অর্ডার করতে:** 'অর্ডার' লিখুন")
+    
+    if stock > 0:
+        attractive_lines.append(f"📞 **দ্রুত অর্ডার:** সরাসরি কল করুন")
+    
+    attractive_lines.append(f"🔙 **অন্য পণ্য দেখতে:** পণ্যের নাম লিখুন")
+    
+    return "\n".join(attractive_lines)
 
 def check_price_query(text: str, products: List[Dict]) -> Tuple[bool, Optional[str]]:
     """চেক করো গ্রাহক দাম জানতে চাচ্ছে কিনা"""
@@ -154,14 +302,7 @@ def check_price_query(text: str, products: List[Dict]) -> Tuple[bool, Optional[s
         for product in products:
             product_name = product.get("name", "").lower().strip()
             if product_name and product_name in text_lower:
-                price = product.get("price", 0)
-                stock = product.get("stock", 0)
-                in_stock = product.get("in_stock", False)
-                
-                if in_stock and stock > 0:
-                    return True, f"{product['name']} এর দাম ৳{price:,}। স্টকে আছে {stock} পিস। অর্ডার দিতে চান?"
-                else:
-                    return True, f"{product['name']} এর দাম ৳{price:,}। কিন্তু এখন স্টকে নেই।"
+                return True, get_product_details_response(product)
         
         # If no specific product mentioned, show all products
         return True, None
@@ -172,20 +313,95 @@ def find_product_in_query(text: str, products: List[Dict]) -> Optional[Dict]:
     """কোয়েরিতে পণ্য খুঁজে বের করো"""
     text_lower = text.lower().strip()
     
+    # Check for product inquiry keywords
+    inquiry_keywords = ['সম্পর্কে', 'বিবরণ', 'বিস্তারিত', 'জানতে', 'about', 'details', 'info', 'information']
+    is_inquiry = any(keyword in text_lower for keyword in inquiry_keywords)
+    
     for product in products:
         product_name = product.get("name", "").lower().strip()
         
         if not product_name:
             continue
             
-        # Exact match
+        # Check if product name is mentioned
         if product_name in text_lower:
             return product
         
-        # Partial match
-        product_words = product_name.split()
-        if any(word in text_lower for word in product_words if len(word) > 3):
-            return product
+        # Check for number selection (if in browsing session)
+        if text_lower.isdigit():
+            # This will be handled in the main response function
+            continue
+        
+        # Check for partial match
+        if is_inquiry:
+            product_words = product_name.split()
+            if any(word in text_lower for word in product_words if len(word) > 2):
+                return product
+    
+    return None
+
+def check_category_browsing(admin_id: str, customer_id: str, user_message: str) -> Optional[str]:
+    """চেক করো গ্রাহক ক্যাটাগরি ব্রাউজিং করছে কিনা"""
+    session_key = f"cat_{admin_id}_{customer_id}"
+    
+    if session_key in _category_sessions:
+        session = _category_sessions[session_key]
+        
+        if session["step"] == "waiting_for_category":
+            categories = session["categories"]
+            user_input = user_message.strip().lower()
+            
+            # Check if input matches any category
+            for category in categories:
+                if category.lower() == user_input:
+                    # Remove category session
+                    del _category_sessions[session_key]
+                    return show_products_by_category(admin_id, customer_id, category)
+            
+            # Check if input is a number
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(categories):
+                    category = categories[idx]
+                    # Remove category session
+                    del _category_sessions[session_key]
+                    return show_products_by_category(admin_id, customer_id, category)
+        
+        # Remove session if not valid
+        del _category_sessions[session_key]
+    
+    return None
+
+def check_product_browsing(admin_id: str, customer_id: str, user_message: str) -> Optional[str]:
+    """চেক করো গ্রাহক পণ্য ব্রাউজিং করছে কিনা"""
+    session_key = f"prod_{admin_id}_{customer_id}"
+    
+    if session_key in _product_browsing_sessions:
+        session = _product_browsing_sessions[session_key]
+        
+        if session["step"] == "waiting_for_product":
+            products = session["products"]
+            user_input = user_message.strip().lower()
+            
+            # Check if input is a number
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(products):
+                    product = products[idx]
+                    # Remove product browsing session
+                    del _product_browsing_sessions[session_key]
+                    return get_product_details_response(product)
+            
+            # Check if input matches any product name
+            for product in products:
+                product_name = product.get("name", "").lower().strip()
+                if product_name and (user_input == product_name or user_input in product_name):
+                    # Remove product browsing session
+                    del _product_browsing_sessions[session_key]
+                    return get_product_details_response(product)
+        
+        # Remove session if not valid
+        del _product_browsing_sessions[session_key]
     
     return None
 
@@ -207,7 +423,7 @@ class OrderSession:
             "status": "pending",
             "total": 0
         }
-        self.products = get_products(admin_id)
+        self.products = get_products_with_details(admin_id)
     
     def start_order(self):
         """Start order collection"""
@@ -242,7 +458,9 @@ class OrderSession:
                 self.step = 4
                 stock = selected_product.get("stock", 0)
                 price = selected_product.get("price", 0)
-                return f"{selected_product['name']} নির্বাচিত! (৳{price:,})\n\nকত পিস চান? (স্টকে আছে: {stock} পিস):", False
+                description = selected_product.get("description", "")
+                features = selected_product.get("features", "")
+                return f"✅ **{selected_product['name']}** নির্বাচিত!\n\n💰 দাম: ৳{price:,}\n📝 বিবরণ: {description}\n🌟 বৈশিষ্ট্য: {features}\n\nকত পিস চান? (স্টকে আছে: {stock} পিস):", False
             else:
                 products_text = self.get_available_products()
                 return f"পণ্যটি খুঁজে পাইনি। আবার চেষ্টা করুন:\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
@@ -259,7 +477,7 @@ class OrderSession:
                             price = product.get("price", 0)
                             self.data["total"] = price * quantity
                             self.step = 5
-                            return f"{quantity} পিস নির্বাচিত! মোট মূল্য: ৳{self.data['total']:,}\n\nএখন আপনার ডেলিভারি ঠিকানা দিন (বিস্তারিত):", False
+                            return f"✅ {quantity} পিস নির্বাচিত!\n💰 মোট মূল্য: ৳{self.data['total']:,}\n\nএখন আপনার ডেলিভারি ঠিকানা দিন (বিস্তারিত):", False
                         else:
                             return f"দুঃখিত, স্টকে মাত্র {stock} পিস আছে। কম সংখ্যক দিন:", False
                 else:
@@ -281,7 +499,7 @@ class OrderSession:
                 if order_saved:
                     completed = True
                     order_id = self.data.get("order_id", "")
-                    return f"✅ অর্ডার সফলভাবে কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: {order_id}\n\nআমরা শীঘ্রই আপনার সাথে যোগাযোগ করব। ধন্যবাদ! 😊\n\nঅন্যান্য পণ্য দেখতে যেকোনো মেসেজ দিন।", True
+                    return f"✅ অর্ডার সফলভাবে কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: {order_id}\n\nআমরা শীঘ্রই আপনার সাথে যোগাযোগ করব। ধন্যবাদ! 😊\n\nঅন্যান্য পণ্য দেখতে 'ক্যাটাগরি' লিখুন।", True
                 else:
                     return "❌ অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।", True
             else:
@@ -304,10 +522,11 @@ class OrderSession:
                 if name:  # Check if name is not empty
                     price = product.get("price", 0)
                     stock = product.get("stock", 0)
-                    available.append(f"- {name} (৳{price:,}, স্টক: {stock})")
+                    description = product.get("description", "")[:50]
+                    available.append(f"- {name} (৳{price:,}, স্টক: {stock})\n  {description}...")
         
         if available:
-            return "স্টকে থাকা পণ্য:\n" + "\n".join(available[:6])
+            return "স্টকে থাকা পণ্য:\n\n" + "\n\n".join(available[:5])
         return "দুঃখিত, এখন কোনো পণ্য স্টকে নেই।"
     
     def find_product(self, query: str) -> Optional[Dict]:
@@ -319,7 +538,7 @@ class OrderSession:
         
         for product in self.products:
             name = product.get("name", "").lower().strip()
-            if name and query_lower in name:
+            if name and (query_lower in name or name in query_lower):
                 if product.get("in_stock", False) and product.get("stock", 0) > 0:
                     return product
         
@@ -426,7 +645,7 @@ def get_groq_key(admin_id: str) -> Optional[str]:
         return None
 
 def get_products(admin_id: str) -> List[Dict]:
-    """Get products"""
+    """Get products from database"""
     cache_key = f"products_{admin_id}"
     
     if cache_key in _product_cache:
@@ -440,19 +659,8 @@ def get_products(admin_id: str) -> List[Dict]:
             .execute()
         
         products = response.data if response.data else []
-        
-        formatted_products = []
-        for product in products:
-            formatted_products.append({
-                "id": product.get("id"),
-                "name": product.get("name", ""),
-                "price": product.get("price", 0),
-                "stock": product.get("stock", 0),
-                "in_stock": product.get("in_stock", False)
-            })
-        
-        _product_cache[cache_key] = formatted_products
-        return formatted_products
+        _product_cache[cache_key] = products
+        return products
         
     except Exception as e:
         logger.error(f"Get products error: {str(e)}")
@@ -477,8 +685,18 @@ def detect_language(text: str) -> str:
 
 def check_order_keywords(text: str) -> bool:
     """Check order keywords"""
-    order_keywords = ['অর্ডার', 'order', 'কিনব', 'buy', 'নিব', 'চাই']
+    order_keywords = ['অর্ডার', 'order', 'কিনব', 'buy', 'নিব', 'চাই', 'পurchase', 'খরিদ']
     return any(keyword in text.lower() for keyword in order_keywords)
+
+def check_category_keywords(text: str) -> bool:
+    """Check category keywords"""
+    category_keywords = ['ক্যাটাগরি', 'category', 'বিভাগ', 'ধরন', 'type', 'ক্যাটাগরী']
+    return any(keyword in text.lower() for keyword in category_keywords)
+
+def check_products_keywords(text: str) -> bool:
+    """Check products keywords"""
+    products_keywords = ['পণ্য', 'products', 'সব পণ্য', 'সকল পণ্য', 'product', 'all products']
+    return any(keyword in text.lower() for keyword in products_keywords)
 
 def send_facebook_message(page_token: str, customer_id: str, message_text: str):
     """Send Facebook message"""
@@ -527,8 +745,8 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
         # Detect language
         language = detect_language(user_message)
         
-        # Get products
-        products = get_products(admin_id)
+        # Get products with details
+        products = get_products_with_details(admin_id)
         
         # Handle first message
         if first_message:
@@ -548,6 +766,24 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
                 session.cancel()
             return response
         
+        # Check category browsing
+        category_response = check_category_browsing(admin_id, customer_id, user_message)
+        if category_response:
+            return category_response
+        
+        # Check product browsing
+        product_browse_response = check_product_browsing(admin_id, customer_id, user_message)
+        if product_browse_response:
+            return product_browse_response
+        
+        # Check if user wants to see categories
+        if check_category_keywords(user_message):
+            return show_categories(admin_id, customer_id)
+        
+        # Check if user wants to see all products
+        if check_products_keywords(user_message):
+            return get_all_products_formatted(admin_id)
+        
         # Check price query
         is_price_query, price_response = check_price_query(user_message, products)
         if is_price_query:
@@ -557,23 +793,11 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
                 # General price query - show all products
                 return get_all_products_formatted(admin_id)
         
-        # Check specific product query
+        # Check specific product query or inquiry
         product = find_product_in_query(user_message, products)
         if product:
-            price = product.get("price", 0)
-            stock = product.get("stock", 0)
-            in_stock = product.get("in_stock", False)
-            
-            if language == "bangla":
-                if in_stock and stock > 0:
-                    return f"{product['name']} এর দাম ৳{price:,}। স্টকে আছে {stock} পিস।\n\nঅর্ডার দিতে 'অর্ডার' লিখুন।\nআরও তথ্যের জন্য আমাদের কল করুন।\nঅন্যান্য পণ্য দেখতে পণ্যের নাম লিখুন।"
-                else:
-                    return f"{product['name']} এর দাম ৳{price:,}। কিন্তু এখন স্টকে নেই।\n\nঅন্যান্য পণ্য দেখতে পণ্যের নাম লিখুন।"
-            else:
-                if in_stock and stock > 0:
-                    return f"{product['name']} price is ৳{price:,}. Stock: {stock} pieces.\n\nType 'order' to purchase.\nCall us for more information.\nType product name for other products."
-                else:
-                    return f"{product['name']} price is ৳{price:,}. Currently out of stock.\n\nType product name for other products."
+            # Always show full product details when product is mentioned
+            return get_product_details_response(product)
         
         # Check order request
         if check_order_keywords(user_message):
@@ -591,17 +815,40 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
         total_products = len(products)
         in_stock_count = sum(1 for p in products if p.get("in_stock", False) and p.get("stock", 0) > 0)
         
+        # Get categories for context
+        categories = get_all_categories(admin_id)
+        categories_text = ", ".join(categories[:5]) if categories else "সাধারণ"
+        
+        # Get some sample products for context
+        product_context = ""
+        if products:
+            # Take up to 3 in-stock products for context
+            in_stock_products = [p for p in products if p.get("in_stock", False) and p.get("stock", 0) > 0][:3]
+            for prod in in_stock_products:
+                name = prod.get("name", "")
+                price = prod.get("price", 0)
+                description = prod.get("description", "")[:60]
+                category = prod.get("category", "")
+                if name:
+                    product_context += f"- {name} ({category}): ৳{price:,} - {description}\n"
+        
         if language == 'bangla':
             system_prompt = f"""তুমি {BOT_NAME}, {page_name}-এর সহকারী।
 
 নিয়মাবলী:
 ১. বন্ধুত্বপূর্ণ ও সহায়ক হও
-২. পণ্যের দাম ও স্টক জানালে বলো
-৩. অর্ডার নিতে সাহায্য করো
-৪. ৪-৫ লাইনের মধ্যে উত্তর দাও
-৫. সংক্ষিপ্ত কিন্তু পূর্ণাঙ্গ উত্তর দাও
+২. গ্রাহককে প্রথমে ক্যাটাগরি দেখাতে বলো ('ক্যাটাগরি' লিখতে বলো)
+৩. পণ্যের আকর্ষণীয় বিবরণ দাও - দাম, বৈশিষ্ট্য, সুবিধা সব বলো
+৪. পণ্যের গুণাগুণ উল্লেখ করে গ্রাহককে আকৃষ্ট করো
+৫. অর্ডার নিতে সাহায্য করো
+৬. ৫-৬ লাইনের মধ্যে আকর্ষণীয় উত্তর দাও
+৭. গ্রাহকের আগ্রহ বাড়ানোর জন্য পণ্যের বিশেষত্ব বলো
 
+ক্যাটাগরি: {categories_text}
 মোট পণ্য: {total_products}টি (স্টকে: {in_stock_count}টি)
+
+পণ্যের তথ্য:
+{product_context}
 
 গ্রাহক: "{user_message}"
 তুমি:"""
@@ -610,12 +857,18 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
 
 Rules:
 1. Be friendly and helpful
-2. Provide product prices and stock
-3. Help with orders
-4. Give answers in 4-5 lines
-5. Keep answers short but complete
+2. First guide customer to see categories (ask to type 'category')
+3. Give attractive product descriptions - price, features, benefits
+4. Attract customers by mentioning product qualities
+5. Help with orders
+6. Give attractive answers in 5-6 lines
+7. Highlight product specialties to increase customer interest
 
+Categories: {categories_text}
 Total products: {total_products} (In stock: {in_stock_count})
+
+Product info:
+{product_context}
 
 Customer: "{user_message}"
 You:"""
@@ -627,16 +880,21 @@ You:"""
             model="llama-3.3-70b-versatile",
             messages=messages,
             temperature=0.7,
-            max_tokens=250,  # Increased from 100 to 250 for longer responses
+            max_tokens=350,  # Increased for better responses
             top_p=0.9
         )
         
         ai_response = response.choices[0].message.content.strip()
+        
+        # Add category suggestion at the end
+        if categories and not check_category_keywords(user_message) and not check_products_keywords(user_message):
+            ai_response += f"\n\n📂 ক্যাটাগরি অনুযায়ী পণ্য দেখতে 'ক্যাটাগরি' লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন"
+        
         return ai_response
         
     except Exception as e:
         logger.error(f"AI Response Error: {str(e)}")
-        return "দুঃখিত, সমস্যা হয়েছে। আবার চেষ্টা করুন। আমাদের কল করুন সরাসরি কথা বলতে।"
+        return "দুঃখিত, সমস্যা হয়েছে। আবার চেষ্টা করুন।\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন"
 
 # ================= WEBHOOK ROUTES =================
 @app.route("/webhook", methods=["GET"])
