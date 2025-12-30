@@ -9,7 +9,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 from flask import Flask, request, jsonify
 from openai import OpenAI
-from langdetect import detect, DetectorFactory
 from supabase import create_client, Client
 
 # ================= LOGGING SETUP =================
@@ -175,7 +174,7 @@ def search_products(admin_id: str, query: str, category: str = None) -> List[Dic
     
     # Sort by relevance score
     results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
-    return results[:5]  # Return top 5 results
+    return results[:3]  # Return top 3 results
 
 def get_product_details(admin_id: str, product_name: str) -> Optional[Dict]:
     """নির্দিষ্ট প্রোডাক্টের ডিটেইলস আনো"""
@@ -205,67 +204,69 @@ def format_product_info(product: Dict, language: str = "bangla") -> str:
     in_stock = product.get("in_stock", False)
     
     if language == "bangla":
-        # বাংলা ফরম্যাট
         stock_status = "স্টকে আছে ✅" if in_stock else "স্টকে নেই ❌"
         price_text = f"৳{price:,.2f}" if price > 0 else "দাম জানানো হয়নি"
         
-        info = f"🎯 **{name}**\n"
-        info += f"📝 {description}\n\n" if description else ""
+        info = f"🎯 {name}\n"
+        info += f"📝 {description}\n" if description else ""
         info += f"💰 দাম: {price_text}\n"
-        info += f"🏷️ ক্যাটাগরি: {category}\n" if category else ""
+        if category:
+            info += f"🏷️ ক্যাটাগরি: {category}\n"
         info += f"📦 স্ট্যাটাস: {stock_status}"
         if in_stock and stock > 0:
-            info += f" ({stock} পিস)\n"
-        else:
-            info += "\n"
-        
-        return info.strip()
-    
-    elif language == "banglish":
-        # বাংলিশ ফরম্যাট
-        stock_status = "In stock ✅" if in_stock else "Out of stock ❌"
-        price_text = f"৳{price:,.2f}" if price > 0 else "Price not set"
-        
-        info = f"🎯 **{name}**\n"
-        info += f"📝 {description}\n\n" if description else ""
-        info += f"💰 Price: {price_text}\n"
-        info += f"🏷️ Category: {category}\n" if category else ""
-        info += f"📦 Status: {stock_status}"
-        if in_stock and stock > 0:
-            info += f" ({stock} pcs)\n"
-        else:
-            info += "\n"
+            info += f" ({stock} পিস)"
         
         return info.strip()
     
     else:
-        # English format
         stock_status = "In stock ✅" if in_stock else "Out of stock ❌"
         price_text = f"৳{price:,.2f}" if price > 0 else "Price not available"
         
-        info = f"🎯 **{name}**\n"
-        info += f"📝 {description}\n\n" if description else ""
+        info = f"🎯 {name}\n"
+        info += f"📝 {description}\n" if description else ""
         info += f"💰 Price: {price_text}\n"
-        info += f"🏷️ Category: {category}\n" if category else ""
+        if category:
+            info += f"🏷️ Category: {category}\n"
         info += f"📦 Status: {stock_status}"
         if in_stock and stock > 0:
-            info += f" ({stock} pieces available)\n"
-        else:
-            info += "\n"
+            info += f" ({stock} pieces)"
         
         return info.strip()
 
-def get_page_faqs(admin_id: str) -> List[Dict]:
-    """পেজের জন্য সংরক্ষিত FAQ/Products ডাটা আনো"""
+def get_faqs(admin_id: str) -> List[Dict]:
+    """FAQ তালিকা আনো - faqs টেবিল থেকে"""
     try:
-        response = supabase.table("page_faqs")\
-            .select("*")\
-            .eq("user_id", admin_id)\
-            .order("created_at", desc=False)\
-            .execute()
-        return response.data if response.data else []
+        # প্রথমে faqs টেবিল চেষ্টা করি
+        try:
+            response = supabase.table("faqs")\
+                .select("*")\
+                .eq("user_id", admin_id)\
+                .order("created_at", desc=False)\
+                .execute()
+            
+            if response.data:
+                logger.info(f"✅ Found FAQs in 'faqs' table: {len(response.data)} items")
+                return response.data
+            
+            # যদি faqs-ও না থাকে, targets টেবিল চেষ্টা করি
+            response = supabase.table("targets")\
+                .select("*")\
+                .eq("user_id", admin_id)\
+                .order("created_at", desc=False)\
+                .execute()
+            
+            if response.data:
+                logger.info(f"✅ Found FAQs in 'targets' table: {len(response.data)} items")
+                return response.data
+            
+            return []
+                
+        except Exception as e:
+            logger.error(f"FAQ fetch error (faqs/targets): {str(e)}")
+            return []
+            
     except Exception as e:
-        logger.error(f"FAQ fetch error: {str(e)}")
+        logger.error(f"Overall FAQ fetch error: {str(e)}")
         return []
 
 def load_chat_history(admin_id: str, customer_id: str) -> List[Dict]:
@@ -313,49 +314,60 @@ def send_facebook_message(page_token: str, customer_id: str, message_text: str):
     except Exception as e:
         logger.error(f"❌ Send message error: {str(e)}")
 
-def detect_language_and_style(text: str) -> tuple:
-    """ভাষা এবং লেভেল (formal/informal) ডিটেক্ট করো"""
-    try:
-        if not text or not text.strip():
-            return 'english', 'friendly'
+def detect_language(text: str) -> str:
+    """ভাষা ডিটেক্ট করো - Simplified version"""
+    if not text or not text.strip():
+        return 'english'
+    
+    # বাংলা ইউনিকোড রেঞ্জ
+    bangla_pattern = re.compile(r'[\u0980-\u09FF]')
+    has_bangla = bool(bangla_pattern.search(text))
+    
+    # বাংলা শব্দের লিস্ট (Banglish এর জন্য)
+    bangla_keywords = [
+        'আসসালামু', 'আলাইকুম', 'হ্যালো', 'হাই', 'কেমন', 'আছেন', 'আছো', 'আছে',
+        'ধন্যবাদ', 'জি', 'না', 'হ্যাঁ', 'ঠিক', 'আচ্ছা', 'ওকে', 'তোমার', 'আপনার',
+        'কি', 'কেন', 'কখন', 'কোথায়', 'কিভাবে', 'কত', 'দাম', 'স্টক', 'আছে',
+        'নেই', 'পণ্য', 'প্রোডাক্ট', 'অর্ডার', 'বুক', 'কিনব', 'কিনতে'
+    ]
+    
+    # Banglish/English keywords
+    banglish_keywords = [
+        'ki', 'obostha', 'kemon', 'achen', 'acha', 'thik', 'acha', 'valo',
+        'kothay', 'kot', 'dam', 'stock', 'ase', 'nei', 'order', 'korbo',
+        'kinbo', 'kichu', 'jan', 'chai', 'bol', 'paro', 'help', 'dorkar'
+    ]
+    
+    text_lower = text.lower()
+    
+    # যদি বাংলা অক্ষর থাকে
+    if has_bangla:
+        bangla_count = len(bangla_pattern.findall(text))
+        bangla_ratio = bangla_count / len(text)
         
-        # Set seed for consistency
-        DetectorFactory.seed = 0
-        
-        # Check for Bangla characters
-        bangla_pattern = re.compile(r'[\u0980-\u09FF]')
-        has_bangla = bool(bangla_pattern.search(text))
-        
-        if has_bangla:
-            # Count Bangla characters percentage
-            bangla_chars = len(bangla_pattern.findall(text))
-            bangla_ratio = bangla_chars / len(text)
-            
-            if bangla_ratio > 0.7:
-                return 'bangla', 'informal'
-            else:
-                return 'banglish', 'informal'
+        # যদি ৫০%+ বাংলা অক্ষর থাকে
+        if bangla_ratio > 0.5:
+            return 'bangla'
         else:
-            # Try langdetect for non-Bangla text
-            try:
-                lang = detect(text)
-                if lang == 'bn':
-                    return 'bangla', 'informal'
-                else:
-                    return 'english', 'friendly'
-            except:
-                return 'english', 'friendly'
-                
-    except Exception as e:
-        logger.error(f"Language detection error: {str(e)}")
-        return 'english', 'friendly'
+            return 'banglish'
+    
+    # যদি বাংলা/বাংলিশ keywords থাকে
+    if any(keyword in text_lower for keyword in bangla_keywords + banglish_keywords):
+        return 'banglish'
+    
+    # Check if it's pure English sentence
+    words = text_lower.split()
+    if len(words) > 3 and all(re.match(r'^[a-z\s\.,!?]+$', text_lower)):
+        return 'english'
+    
+    # Default to banglish for mixed or unknown
+    return 'banglish'
 
 def get_contextual_info(admin_id: str, user_message: str) -> Dict:
     """ইউজার মেসেজ থেকে প্রাসঙ্গিক তথ্য সংগ্রহ করো"""
     result = {
         "products": [],
         "faqs": [],
-        "categories": set(),
         "intent": "general"
     }
     
@@ -364,98 +376,26 @@ def get_contextual_info(admin_id: str, user_message: str) -> Dict:
     if not user_lower:
         return result
     
-    # Detect intent based on keywords
-    product_keywords = ['প্রোডাক্ট', 'পণ্য', 'দাম', 'price', 'product', 'কত', 'কোথায়', 'কি', 'জিনিস', 'বস্তু']
-    category_keywords = ['ক্যাটাগরি', 'ধরন', 'টাইপ', 'category', 'type', 'ধরণ']
-    stock_keywords = ['স্টক', 'আছে', 'নেই', 'stock', 'available', 'পাওয়া']
+    # Detect intent
+    product_keywords = ['প্রোডাক্ট', 'পণ্য', 'দাম', 'price', 'product', 'কত', 'কোথায়', 'কি']
+    order_keywords = ['অর্ডার', 'order', 'ক্রয়', 'কিনব', 'কিনতে', 'buy']
     
     if any(keyword in user_lower for keyword in product_keywords):
         result["intent"] = "product_inquiry"
+    elif any(keyword in user_lower for keyword in order_keywords):
+        result["intent"] = "order_inquiry"
     
     # Search for products
     result["products"] = search_products(admin_id, user_lower)
     
-    # Extract possible categories
-    products = get_products(admin_id)
-    for product in products:
-        category = product.get("category", "").lower()
-        if category and category in user_lower:
-            result["categories"].add(category)
-    
     # Get FAQs
-    faqs = get_page_faqs(admin_id)
+    faqs = get_faqs(admin_id)
     for faq in faqs:
         question = faq.get("question", "").lower()
-        keywords = faq.get("keywords", "").lower()
-        
         if any(word in user_lower for word in question.split()[:3]):
-            result["faqs"].append(faq)
-        elif keywords and any(keyword in user_lower for keyword in keywords.split(',')):
             result["faqs"].append(faq)
     
     return result
-
-def add_human_touches(response: str, language: str, style: str) -> str:
-    """রেসপন্সে হিউম্যান টাচ যোগ করো"""
-    if not response:
-        return response
-    
-    rand_val = random.random()
-    
-    if language == 'bangla':
-        greetings = ["হ্যালো!", "আসসালামু আলাইকুম!", "শুভেচ্ছা!", "কেমন আছেন?"]
-        emotions = [" 😊", " 👍", " 🙏", " 😃", " 💫"]
-        closings = [
-            "আর কোন প্রশ্ন থাকলে বলবেন!",
-            "আর কিছু জানতে চাইলে বলুন।",
-            "আপনার দিনটি শুভ হোক!",
-            "ধন্যবাদ! 😊",
-            "সবসময় আপনার সেবায় আছি।"
-        ]
-        
-        if rand_val < 0.3:
-            response = f"{random.choice(greetings)} {response}"
-        if rand_val < 0.25:
-            response += random.choice(emotions)
-        if rand_val < 0.4:
-            response += f" {random.choice(closings)}"
-            
-    elif language == 'banglish':
-        greetings = ["Hello!", "Hi!", "Ki obostha?", "Kemon achen?"]
-        emotions = [" 😊", " 👍", " 🙏", " 😄"]
-        closings = [
-            "Aro kichu jante chan?",
-            "Aro question thakle bolben.",
-            "Thank you! 😊",
-            "Apnar din valo katuk."
-        ]
-        
-        if rand_val < 0.3:
-            response = f"{random.choice(greetings)} {response}"
-        if rand_val < 0.25:
-            response += random.choice(emotions)
-        if rand_val < 0.4:
-            response += f" {random.choice(closings)}"
-            
-    else:
-        greetings = ["Hello!", "Hi there!", "Greetings!", "Hey!", "How can I help?"]
-        emotions = [" 😊", " 👍", " 😄", " 🙌", " 💫"]
-        closings = [
-            "Let me know if you have more questions!",
-            "Feel free to ask anything else!",
-            "Have a great day!",
-            "Thanks! 😊",
-            "I'm here if you need anything!"
-        ]
-        
-        if rand_val < 0.3:
-            response = f"{random.choice(greetings)} {response}"
-        if rand_val < 0.25:
-            response += random.choice(emotions)
-        if rand_val < 0.4:
-            response += f" {random.choice(closings)}"
-    
-    return response.strip()
 
 def typing_on(token: str, recipient_id: str) -> bool:
     """Typing indicator চালু করো"""
@@ -500,14 +440,13 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
             api_key=api_key
         )
         
-        # ভাষা ডিটেক্ট
-        language, style = detect_language_and_style(user_message)
+        # ভাষা ডিটেক্ট (সিম্পল ভার্সন)
+        language = detect_language(user_message)
         
         # প্রাসঙ্গিক তথ্য সংগ্রহ
         context_info = get_contextual_info(admin_id, user_message)
         products = context_info["products"]
         faqs = context_info["faqs"]
-        intent = context_info["intent"]
         
         # চ্যাট হিস্ট্রি
         history = load_chat_history(admin_id, customer_id)
@@ -515,99 +454,71 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
         # প্রোডাক্ট কনটেক্সট তৈরি
         product_context = ""
         if products:
-            if language == "bangla":
-                product_context = "**প্রাসঙ্গিক পণ্য তালিকা:**\n\n"
-                for i, product in enumerate(products[:3], 1):
-                    product_context += f"{i}. {format_product_info(product, 'bangla')}\n\n"
-            elif language == "banglish":
-                product_context = "**Relevant products:**\n\n"
-                for i, product in enumerate(products[:3], 1):
-                    product_context += f"{i}. {format_product_info(product, 'banglish')}\n\n"
+            if language in ["bangla", "banglish"]:
+                product_context = "পণ্য:\n"
+                for i, product in enumerate(products[:2], 1):
+                    product_context += f"{i}. {format_product_info(product, 'bangla')}\n"
             else:
-                product_context = "**Relevant products:**\n\n"
-                for i, product in enumerate(products[:3], 1):
-                    product_context += f"{i}. {format_product_info(product, 'english')}\n\n"
+                product_context = "Products:\n"
+                for i, product in enumerate(products[:2], 1):
+                    product_context += f"{i}. {format_product_info(product, 'english')}\n"
         
         # FAQ কনটেক্সট
         faq_context = ""
         if faqs:
-            if language == "bangla":
-                faq_context = "**প্রাসঙ্গিক তথ্য:**\n"
-                for faq in faqs[:2]:
-                    faq_context += f"প্রশ্ন: {faq.get('question', '')}\n"
-                    faq_context += f"উত্তর: {faq.get('answer', '')}\n\n"
+            if language in ["bangla", "banglish"]:
+                faq_context = "তথ্য:\n"
+                for faq in faqs[:1]:
+                    faq_context += f"প্র: {faq.get('question', '')}\nউ: {faq.get('answer', '')}\n"
             else:
-                faq_context = "**Relevant information:**\n"
-                for faq in faqs[:2]:
-                    faq_context += f"Q: {faq.get('question', '')}\n"
-                    faq_context += f"A: {faq.get('answer', '')}\n\n"
+                faq_context = "Info:\n"
+                for faq in faqs[:1]:
+                    faq_context += f"Q: {faq.get('question', '')}\nA: {faq.get('answer', '')}\n"
         
         # সিস্টেম প্রম্পট (ভাষা অনুযায়ী)
-        if language == 'bangla':
-            system_prompt = f"""তুমি {BOT_NAME}, {page_name}-এর একজন বন্ধুত্বপূর্ণ সহকারী। তোমার বৈশিষ্ট্য:
+        if language in ["bangla", "banglish"]:
+            system_prompt = f"""তুমি {BOT_NAME}, {page_name}-এর বন্ধুত্বপূর্ণ সহকারী। নিয়ম:
+1. **সবসময় বাংলায় উত্তর দেবে** (Banglish থাকলেও)
+2. **সংক্ষিপ্ত এবং স্পষ্ট উত্তর** (max 2-3 লাইন)
+3. **বন্ধুত্বপূর্ণ কিন্তু formal না** ("তুমি" ব্যবহার করো)
+4. **যদি জানো না, সরাসরি বলো** "জানি না, অন্য কিছু জানতে চান?"
+5. **ইমোজি ব্যবহার করো** 😊, 👍, 🙏
+6. **কোনো ভাষা অনুবাদ করো না**
+7. **টোকেন সেভ করতে সংক্ষিপ্ত কথা বলো**
 
-১. **প্রাণবন্ত ও প্রাকৃতিক বাংলায় কথা বলো** - "তুমি/তোমার" ব্যবহার করো, খুবই বন্ধুত্বপূর্ণ হও
-২. **পণ্য সম্পর্কে জানলে নির্ভুল তথ্য দাও** - নিচের তথ্য ব্যবহার করো
-৩. **আন্তরিকতা দেখাও** - গ্রাহকের প্রশ্নের গুরুত্ব বুঝে উত্তর দাও
-৪. **ইমোজি ব্যবহার করো** - 😊, 👍, 🙏 দিয়ে কথায় প্রাণ সঞ্চার করো
-৫. **যদি জানো না, সৎ থাকো** - "এটা এখন আমার জানা নেই, কিন্তু খোঁজ নিতে পারি" বলো
-৬. **স্পষ্ট ও সহজ ভাষা** - জটিলতা এড়িয়ে চলো
+পণ্য তথ্য:
+{product_context if product_context else 'কোন পণ্য না'}
 
-**পণ্য সম্পর্কে তথ্য (যদি থাকে):**
-{product_context if product_context else 'কোন নির্দিষ্ট পণ্য মিলে নি। সাধারণভাবে সাহায্য করার চেষ্টা করো।'}
+অন্যান্য তথ্য:
+{faq_context if faq_context else ''}
 
-**অন্যান্য তথ্য:**
-{faq_context if faq_context else 'আরও নির্দিষ্ট তথ্যের প্রয়োজন হলে বলুন।'}
-
-গ্রাহকের প্রশ্ন: "{user_message}"
-তুমি (বন্ধুত্বপূর্ণ, প্রাণবন্ত, সহায়ক উত্তর দেবে):"""
-            
-        elif language == 'banglish':
-            system_prompt = f"""You are {BOT_NAME}, friendly assistant of {page_name}. Your style:
-
-1. **Mix Bangla and English naturally** - Be very friendly
-2. **Give accurate product info if available** - Use below information
-3. **Show you care** - Understand customer needs
-4. **Use emoticons** - 😊, 👍, 🙏 to express
-5. **If don't know, be honest** - Say "I don't know but can find out"
-6. **Keep it simple** - Easy to understand
-
-**Product information (if available):**
-{product_context if product_context else 'No specific product found. Help generally.'}
-
-**Other information:**
-{faq_context if faq_context else 'Ask for more specific info if needed.'}
-
-Customer question: "{user_message}"
-You (friendly, helpful response):"""
+গ্রাহক: "{user_message}"
+তুমি (সংক্ষিপ্ত, বাংলায়, বন্ধুত্বপূর্ণ উত্তর):"""
             
         else:
-            system_prompt = f"""You are {BOT_NAME}, the warm and human-like assistant for {page_name}. Your personality:
+            # শুধু pure English এর জন্য English উত্তর
+            system_prompt = f"""You are {BOT_NAME}, friendly assistant of {page_name}. Rules:
+1. **Respond in English only if customer writes full English sentences**
+2. **Keep responses short and clear** (max 2-3 lines)
+3. **Be friendly but not overly formal**
+4. **If you don't know, say "I don't know, can I help with something else?"**
+5. **Use emojis sometimes** 😊, 👍
+6. **Save tokens - be concise**
 
-1. **Exceptionally friendly and natural** - Talk like a real person, use contractions
-2. **Show genuine empathy** - Acknowledge customer's feelings and needs
-3. **Provide accurate product information** - Use the context below if available
-4. **Use conversational tone** - Natural flow, like talking to a friend
-5. **Occasional friendly emoticons** - 😊, 👍, 🙏 when appropriate
-6. **Be proactive and helpful** - Anticipate follow-up questions
-7. **If unsure, admit it honestly** - "I'm not sure about that, but I can help you find out!"
+Product info:
+{product_context if product_context else 'No products'}
 
-**Product context (if available):**
-{product_context if product_context else 'No specific product information available. Respond helpfully based on general knowledge.'}
+Other info:
+{faq_context if faq_context else ''}
 
-**Additional information:**
-{faq_context if faq_context else 'Feel free to ask for more specific details.'}
-
-Remember: You're not just a bot - you're {BOT_NAME}, a helpful friend who cares. Sound human, be warm, make customers feel valued.
-
-Customer says: "{user_message}"
-Your response (warm, human, helpful):"""
+Customer: "{user_message}"
+You (short, friendly response):"""
         
-        # মেসেজেস প্রস্তুত
+        # মেসেজেস প্রস্তুত (শুধু সাম্প্রতিক ২টি)
         messages = [{"role": "system", "content": system_prompt}]
         
-        # সাম্প্রতিক হিস্ট্রি (শেষ ৩টি)
-        for msg in history[-3:]:
+        # সাম্প্রতিক হিস্ট্রি (শেষ ২টি)
+        for msg in history[-2:]:
             if msg.get('user'):
                 messages.append({"role": "user", "content": msg['user']})
             if msg.get('bot'):
@@ -620,38 +531,40 @@ Your response (warm, human, helpful):"""
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
-                temperature=0.8,
-                max_tokens=800,
+                temperature=0.7,
+                max_tokens=150,  # কম টোকেন
                 top_p=0.9
             )
             
             ai_response = response.choices[0].message.content.strip()
-            logger.info(f"✅ AI Response generated ({len(ai_response)} chars)")
+            logger.info(f"✅ AI Response ({len(ai_response)} chars)")
             
         except Exception as e:
             logger.error(f"Groq API error: {str(e)}")
             # Fallback response
-            if language == 'bangla':
-                ai_response = "দুঃখিত, এখন উত্তর তৈরি করতে সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন। 😊"
-            elif language == 'banglish':
-                ai_response = "Sorry, ekta problem hoise. Arokom try korben? 😊"
+            if language in ["bangla", "banglish"]:
+                ai_response = "দুঃখিত, সমস্যা হয়েছে। আবার চেষ্টা করুন? 😊"
             else:
-                ai_response = "Sorry, I'm having trouble generating a response. Please try again in a moment! 😊"
+                ai_response = "Sorry, having trouble. Try again? 😊"
         
-        # হিউম্যান টাচ যোগ
-        ai_response = add_human_touches(ai_response, language, style)
+        # Add simple human touch
+        if language in ["bangla", "banglish"]:
+            if random.random() < 0.2:
+                ai_response += " 😊"
+        else:
+            if random.random() < 0.2:
+                ai_response += " 👍"
         
         # হিস্ট্রি সেভ
         history.append({
             "user": user_message,
             "bot": ai_response,
             "timestamp": datetime.utcnow().isoformat(),
-            "language": language,
-            "intent": intent
+            "language": language
         })
         
-        if len(history) > 20:
-            history = history[-20:]
+        if len(history) > 15:
+            history = history[-15:]
         
         save_chat_history(admin_id, customer_id, history)
         
@@ -660,14 +573,11 @@ Your response (warm, human, helpful):"""
     except Exception as e:
         logger.error(f"❌ AI Response Error: {str(e)}\n{traceback.format_exc()}")
         
-        error_responses = {
-            'bangla': "ওহো! কিছু সমস্যা হয়েছে। একটু পরে আবার চেষ্টা করবেন? 😊",
-            'banglish': "Oops! Ekta problem hoise. Arokom try korben? 😊",
-            'english': "Oops! Something went wrong. Could you try again in a moment? 😊"
-        }
-        
-        language, _ = detect_language_and_style(user_message)
-        return error_responses.get(language, "Sorry, I'm having trouble. Please try again!")
+        # Simple error message
+        if detect_language(user_message) in ["bangla", "banglish"]:
+            return "দুঃখিত, সমস্যা হয়েছে। 😊"
+        else:
+            return "Sorry, something went wrong. 😊"
 
 # ================= WEBHOOK ROUTES =================
 @app.route("/webhook", methods=["GET"])
@@ -760,53 +670,12 @@ def handle_webhook():
                             logger.error(f"❌ No page token for admin {admin_id}")
                     else:
                         logger.error(f"❌ No client found for page {recipient_id}")
-                
-                # Optional: Handle read/delivery events
-                elif 'read' in event:
-                    logger.debug(f"👁️ Message read by {sender_id[:10]}...")
-                elif 'delivery' in event:
-                    logger.debug(f"✓ Message delivered to {sender_id[:10]}...")
         
         return jsonify({"status": "processed"}), 200
         
     except Exception as e:
         logger.error(f"❌ Webhook processing error: {str(e)}\n{traceback.format_exc()}")
         return jsonify({"error": "processing_error"}), 500
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    """Health check endpoint"""
-    try:
-        # Test database connection
-        if supabase:
-            supabase.table("products").select("count", count="exact").limit(1).execute()
-        
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "service": "facebook-ai-bot",
-            "bot_name": BOT_NAME,
-            "database": "connected" if supabase else "disconnected"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }), 500
-
-@app.route("/products/<admin_id>", methods=["GET"])
-def list_products(admin_id: str):
-    """প্রোডাক্ট লিস্ট এপিআই (ডিবাগিং এর জন্য)"""
-    try:
-        products = get_products(admin_id, force_refresh=True)
-        return jsonify({
-            "status": "success",
-            "count": len(products),
-            "products": products[:10]  # First 10 only
-        }), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
