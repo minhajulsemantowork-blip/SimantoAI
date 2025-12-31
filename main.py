@@ -657,12 +657,12 @@ def check_order_keywords(text: str) -> bool:
 def check_category_keywords(text: str) -> bool:
     """Check category keywords"""
     category_keywords = ['ক্যাটাগরি', 'category', 'বিভাগ', 'ধরন', 'type', 'ক্যাটাগরী']
-    return any(keyword in text.lower() for keyword in order_keywords)
+    return any(keyword in text.lower() for keyword in category_keywords)
 
 def check_products_keywords(text: str) -> bool:
     """Check products keywords"""
     products_keywords = ['পণ্য', 'products', 'সব পণ্য', 'সকল পণ্য', 'product', 'all products']
-    return any(keyword in text.lower() for keyword in order_keywords)
+    return any(keyword in text.lower() for keyword in products_keywords)
 
 def send_facebook_message(page_token: str, customer_id: str, message_text: str):
     """Send Facebook message"""
