@@ -40,7 +40,8 @@ _page_to_client_cache = {}
 _product_cache = {}
 _order_sessions = {}  # Store order collection sessions
 _first_message_cache = {}  # Track first messages
-_conversation_states = {}  # Track natural conversation states
+_category_sessions = {}  # Track category browsing sessions
+_product_browsing_sessions = {}  # Track product browsing sessions
 
 # ================= HELPER FUNCTIONS =================
 def is_first_message(admin_id: str, customer_id: str) -> bool:
@@ -51,6 +52,7 @@ def is_first_message(admin_id: str, customer_id: str) -> bool:
         return _first_message_cache[cache_key]
     
     try:
+        # Check if chat history exists
         response = supabase.table("chat_history")\
             .select("messages")\
             .eq("user_id", admin_id)\
@@ -64,6 +66,29 @@ def is_first_message(admin_id: str, customer_id: str) -> bool:
     except Exception as e:
         logger.error(f"Check first message error: {str(e)}")
         return True
+
+def get_welcome_response(page_name: str, language: str = "bangla") -> str:
+    """Welcome message তৈরি করো"""
+    greetings_bangla = [
+        "আসসালামু আলাইকুম! 😊",
+        "হ্যালো! স্বাগতম! 😊", 
+        "নমস্কার! 😊",
+        "শুভেচ্ছা! 😊"
+    ]
+    
+    greetings_english = [
+        "Hello! Welcome! 😊",
+        "Hi there! 😊",
+        "Greetings! 😊",
+        "Welcome! 😊"
+    ]
+    
+    if language == "bangla":
+        greeting = random.choice(greetings_bangla)
+        return f"{greeting}\n\n{page_name}-এ আপনাকে স্বাগতম! আমি {BOT_NAME}, আপনার সহায়ক।\n\nকিভাবে সাহায্য করতে পারি?\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন\nঅর্ডার দিতে 'অর্ডার' লিখুন"
+    else:
+        greeting = random.choice(greetings_english)
+        return f"{greeting}\n\nWelcome to {page_name}! I'm {BOT_NAME}, your assistant.\n\nHow can I help you today?\n\nType 'category' to see categories\nType 'products' to see all products\nType 'order' to place order"
 
 def get_products_with_details(admin_id: str) -> List[Dict]:
     """সকল প্রোডাক্টের বিস্তারিত তথ্য নিয়ে আসো"""
@@ -88,646 +113,263 @@ def get_products_with_details(admin_id: str) -> List[Dict]:
     
     return detailed_products
 
-def get_products(admin_id: str) -> List[Dict]:
-    """Get products from database"""
-    cache_key = f"products_{admin_id}"
+def get_all_categories(admin_id: str) -> List[str]:
+    """সকল ক্যাটাগরি লিস্ট করো"""
+    products = get_products_with_details(admin_id)
     
-    if cache_key in _product_cache:
-        return _product_cache[cache_key]
-    
-    try:
-        response = supabase.table("products")\
-            .select("*")\
-            .eq("user_id", admin_id)\
-            .order("created_at", desc=True)\
-            .execute()
-        
-        products = response.data if response.data else []
-        _product_cache[cache_key] = products
-        return products
-        
-    except Exception as e:
-        logger.error(f"Get products error: {str(e)}")
+    if not products:
         return []
+    
+    categories = set()
+    for product in products:
+        category = product.get("category", "").strip()
+        if category:
+            categories.add(category)
+    
+    return sorted(list(categories))
 
-def detect_language(text: str) -> str:
-    """Detect language"""
-    if not text:
-        return 'bangla'
+def get_all_products_formatted(admin_id: str) -> str:
+    """সকল প্রোডাক্টের লিস্ট ফরম্যাট করে রিটার্ন করো"""
+    products = get_products_with_details(admin_id)
     
-    text_lower = text.lower()
-    bangla_pattern = re.compile(r'[\u0980-\u09FF]')
+    if not products:
+        return "দুঃখিত, এখন কোনো পণ্য পাওয়া যাচ্ছে না।"
     
-    if bangla_pattern.search(text):
-        return 'bangla'
-    
-    banglish_keywords = ['ki', 'kemon', 'achen', 'acha', 'valo', 'kothay', 'kot', 'dam']
-    if any(keyword in text_lower for keyword in banglish_keywords):
-        return 'bangla'
-    
-    return 'english'
-
-def check_order_keywords(text: str) -> bool:
-    """Check order keywords"""
-    order_keywords = ['অর্ডার', 'order', 'কিনব', 'buy', 'নিব', 'চাই', 'পurchase', 'খরিদ']
-    return any(keyword in text.lower() for keyword in order_keywords)
-
-# ================= PRODUCT RECOMMENDATION ENGINE =================
-class ProductRecommender:
-    """প্রোডাক্ট রিকমেন্ডেশন ইঞ্জিন"""
-    
-    def __init__(self, products: List[Dict]):
-        self.products = products
-    
-    def recommend_by_context(self, context: Dict) -> List[Dict]:
-        """কনটেক্সট অনুযায়ী প্রোডাক্ট রিকমেন্ড করো"""
-        available_products = [p for p in self.products if p.get("in_stock", False) and p.get("stock", 0) > 0]
-        
-        if not available_products:
-            return []
-        
-        customer_type = context.get("customer_type", "personal")
-        priorities = context.get("priorities", [])
-        
-        scored_products = []
-        
-        for product in available_products:
-            score = 0
-            
-            # কাস্টমার টাইপ অনুযায়ী স্কোর
-            if customer_type == "gift_buyer":
-                if self._is_good_for_gift(product):
-                    score += 3
-            elif customer_type == "business":
-                if self._is_good_for_business(product):
-                    score += 3
-            
-            # প্রায়োরিটি অনুযায়ী স্কোর
-            if "budget" in priorities:
-                price = product.get("price", 0)
-                if price < 1000:
-                    score += 2
-                elif price < 3000:
-                    score += 1
-            elif "quality" in priorities:
-                if self._has_quality_keywords(product):
-                    score += 2
-            
-            # র‍্যান্ডম কিছু ভ্যারিয়েশন
-            score += random.random()  # 0-1 র‍্যান্ডম স্কোর
-            
-            scored_products.append((score, product))
-        
-        # স্কোর অনুযায়ী সাজাও
-        scored_products.sort(key=lambda x: x[0], reverse=True)
-        
-        # শুধু ১-২টা প্রোডাক্ট রিটার্ন করো
-        return [p[1] for p in scored_products[:2]]
-    
-    def _is_good_for_gift(self, product: Dict) -> bool:
-        """গিফটের জন্য ভালো কিনা চেক করো"""
-        product_text = f"{product.get('name', '')} {product.get('description', '')} {product.get('category', '')}".lower()
-        gift_keywords = ['gift', 'উপহার', 'প্রেজেন্ট', 'সৌজন্য', 'বক্স', 'প্যাকেজ', 'উপহার', 'gifting']
-        return any(keyword in product_text for keyword in gift_keywords)
-    
-    def _is_good_for_business(self, product: Dict) -> bool:
-        """বিজনেসের জন্য ভালো কিনা চেক করো"""
-        product_text = f"{product.get('name', '')} {product.get('description', '')} {product.get('category', '')}".lower()
-        business_keywords = ['office', 'অফিস', 'বিজনেস', 'কোম্পানি', 'professional', 'corporate', 'executive']
-        return any(keyword in product_text for keyword in business_keywords)
-    
-    def _has_quality_keywords(self, product: Dict) -> bool:
-        """কোয়ালিটি কি-ওয়ার্ড আছে কিনা চেক করো"""
-        product_text = f"{product.get('name', '')} {product.get('description', '')} {product.get('features', '')}".lower()
-        quality_keywords = ['premium', 'হাইকোয়ালিটি', 'best', 'টেকসই', 'durable', 'উচ্চমান', 'quality', 'standard']
-        return any(keyword in product_text for keyword in quality_keywords)
-
-# ================= NATURAL CONVERSATION MANAGER =================
-class NaturalConversationManager:
-    """প্রাকৃতিক কথোপকথন ম্যানেজার"""
-    
-    def __init__(self, admin_id: str, customer_id: str):
-        self.admin_id = admin_id
-        self.customer_id = customer_id
-        self.state_key = f"conv_{admin_id}_{customer_id}"
-        self.products = get_products_with_details(admin_id)
-        self.recommender = ProductRecommender(self.products)
-        
-        if self.state_key not in _conversation_states:
-            _conversation_states[self.state_key] = {
-                "step": "greeting",
-                "intent": None,
-                "customer_type": None,
-                "priorities": [],
-                "last_recommended": None,
-                "conversation_history": []
-            }
-        
-        self.state = _conversation_states[self.state_key]
-    
-    def process_message(self, user_message: str, page_name: str) -> str:
-        """ইউজার মেসেজ প্রসেস করো"""
-        user_message_clean = user_message.strip()
-        self.state["conversation_history"].append({"role": "user", "content": user_message_clean})
-        
-        # ইমারজেন্সি কেস: সরাসরি অর্ডার
-        if check_order_keywords(user_message_clean) and self.state.get("last_recommended"):
-            return self._handle_direct_order()
-        
-        current_step = self.state["step"]
-        
-        if current_step == "greeting":
-            return self._handle_greeting(user_message_clean, page_name)
-        elif current_step == "understanding":
-            return self._handle_understanding(user_message_clean)
-        elif current_step == "recommendation":
-            return self._handle_recommendation(user_message_clean)
-        elif current_step == "explanation":
-            return self._handle_explanation(user_message_clean)
-        elif current_step == "soft_cta":
-            return self._handle_soft_cta(user_message_clean)
-        elif current_step == "objection":
-            return self._handle_objection(user_message_clean)
-        else:
-            return self._handle_ai_fallback(user_message_clean, page_name)
-    
-    def _handle_greeting(self, message: str, page_name: str) -> str:
-        """গ্রিটিং হ্যান্ডেল করো"""
-        # যদি প্রথম বার্তা হয়
-        if len(self.state["conversation_history"]) <= 1:
-            greetings = [
-                f"হাই 👋 {page_name}-এ আপনাকে স্বাগতম! আমি {BOT_NAME}, আপনার সহায়ক 😊\n\nকীভাবে সাহায্য করতে পারি আজকে?",
-                f"সালাম 🙂 {page_name} পেজে স্বাগতম! আমি {BOT_NAME} 🫶\n\nআজকে কি প্রয়োজন?",
-                f"নমস্কার 🙏 {page_name}-এ স্বাগতম! আমি {BOT_NAME}, আপনার পাশে আছি 😊\n\nকী খুঁজছেন আজকে?"
-            ]
-            response = random.choice(greetings)
-        else:
-            # গ্রিটিং এর জবাব
-            greeting_responses = ['হাই', 'হ্যালো', 'সালাম', 'ভালো', 'আছি', 'hello', 'hi', 'fine']
-            if any(greet in message.lower() for greet in greeting_responses):
-                responses = [
-                    "ভালো লাগলো আপনার সাথে কথা বলে 😊 তাহলে বলুন, আজকে কি খুঁজছেন?",
-                    "বেশ ভালো আছি, ধন্যবাদ 🫶 আপনার কী দরকার আজ? একটু আমাকে বলুন...",
-                    "শুভেচ্ছা রইলো 🙏 আপনার কী প্রয়োজন, আমি এখানেই আছি সাহায্য করতে 😌"
-                ]
-                response = random.choice(responses)
-            else:
-                # সাধারণ কথোপকথন শুরু করো
-                response = "দেখি, কীভাবে সাহায্য করতে পারি? 😊 আপনি কি কিছু খুঁজছেন নাকি জানতে চাচ্ছেন?"
-        
-        self.state["step"] = "understanding"
-        self.state["conversation_history"].append({"role": "assistant", "content": response})
-        return response
-    
-    def _handle_understanding(self, message: str) -> str:
-        """ইউজার ইন্টেন্ট বোঝো"""
-        message_lower = message.lower()
-        
-        # ইন্টেন্ট এক্সট্র্যাক্ট করো
-        intent_recognized = False
-        
-        # ক্রেতার টাইপ চিহ্নিত করো
-        if any(word in message_lower for word in ['গিফট', 'উপহার', 'দেব', 'present', 'gift']):
-            self.state["customer_type"] = "gift_buyer"
-            intent_recognized = True
-        
-        elif any(word in message_lower for word in ['অফিস', 'বিজনেস', 'কোম্পানি', 'office', 'business', 'corporate']):
-            self.state["customer_type"] = "business"
-            intent_recognized = True
-        
-        elif any(word in message_lower for word in ['নিজের', 'আমার', 'মার', 'my', 'personal', 'আমি']):
-            self.state["customer_type"] = "personal"
-            intent_recognized = True
-        
-        # প্রায়োরিটি চিহ্নিত করো
-        if any(word in message_lower for word in ['দাম', 'কম', 'সস্তা', 'cheap', 'low', 'বাজেট']):
-            self.state["priorities"].append("budget")
-            intent_recognized = True
-        
-        if any(word in message_lower for word in ['ভালো', 'quality', 'টেকসই', 'durable', 'প্রিমিয়াম']):
-            self.state["priorities"].append("quality")
-            intent_recognized = True
-        
-        if any(word in message_lower for word in ['দ্রুত', 'quick', 'আজকে', 'urgent', 'তাড়াতাড়ি']):
-            self.state["priorities"].append("urgency")
-            intent_recognized = True
-        
-        if intent_recognized:
-            self.state["step"] = "recommendation"
-            
-            # কনটেক্সট অনুযায়ী ওয়ান ফোলো-আপ প্রশ্ন
-            follow_up = self._generate_follow_up_question()
-            self.state["conversation_history"].append({"role": "assistant", "content": follow_up})
-            return follow_up
-        else:
-            # যদি ইন্টেন্ট বোঝা না যায়, AI ব্যবহার করো
-            self.state["step"] = "understanding"
-            ai_response = self._get_ai_response(message, "আমি আপনার need বুঝতে চেষ্টা করছি। একটু আরো বলবেন?")
-            self.state["conversation_history"].append({"role": "assistant", "content": ai_response})
-            return ai_response
-    
-    def _generate_follow_up_question(self) -> str:
-        """ওয়ান ফোলো-আপ প্রশ্ন জেনারেট করো"""
-        customer_type = self.state.get("customer_type", "personal")
-        priorities = self.state.get("priorities", [])
-        
-        if customer_type == "gift_buyer":
-            questions = [
-                "গিফটের জন্য! ভালো তো 👍 বয়স কত যার জন্য?",
-                "উপহার দেবেন? 🎁 recipient এর age group টা একটু বলবেন?",
-                "গিফটিং এর জন্য! 😊 কি occasion এর জন্য? birthday, anniversary নাকি general?"
-            ]
-        
-        elif customer_type == "business":
-            questions = [
-                "বিজনেসের জন্য? office setup নাকি client gift?",
-                "কর্পোরেট ইউজ? 💼 office decoration নাকি employee gift?",
-                "বিজনেস প্রয়োজন? professional look priority নাকি bulk order?"
-            ]
-        
-        else:  # personal
-            if "budget" in priorities:
-                questions = [
-                    "বাজেট friendly option চান? আনুমানিক range টা কেমন?",
-                    "দাম priority? 👍 আনুমানিক কত রাখতে চান?",
-                    "বাজেট conscious? 💸 specific range বললে perfect match খুঁজে দেব"
-                ]
-            elif "quality" in priorities:
-                questions = [
-                    "quality priority? দাম একটু বেশি হলেও চলবে?",
-                    "টেকসই জিনিস চান? 👍 premium segment দেখাবো?",
-                    "quality focus? 😊 high-end options prefer করবেন?"
-                ]
-            else:
-                questions = [
-                    "কেমন ধরনের জিনিস পছন্দ করেন? modern look নাকি classic style?",
-                    "কোন vibe prefer করেন? 😊 minimal নাকি vibrant?",
-                    "স্টাইলের preference টা একটু বলবেন? contemporary নাকি traditional?"
-                ]
-        
-        return random.choice(questions)
-    
-    def _handle_recommendation(self, message: str) -> str:
-        """মাইক্রো রিকমেন্ডেশন দাও"""
-        # ইউজারের উত্তর থেকে আরো ইনফো এক্সট্র্যাক্ট করো
-        self._update_context_from_response(message)
-        
-        # প্রোডাক্ট রিকমেন্ড করো
-        context = {
-            "customer_type": self.state.get("customer_type", "personal"),
-            "priorities": self.state.get("priorities", [])
-        }
-        
-        recommended_products = self.recommender.recommend_by_context(context)
-        
-        if not recommended_products:
-            self.state["step"] = "explanation"
-            response = "দুঃখিত, এখন স্টকে আপনার জন্য matching product নেই 😔\n\nঅন্যান্য option নিয়ে ভাবতে চান?"
-            self.state["conversation_history"].append({"role": "assistant", "content": response})
-            return response
-        
-        # শুধু ১টা প্রোডাক্ট সিলেক্ট করো
-        selected_product = recommended_products[0]
-        self.state["last_recommended"] = selected_product
-        self.state["step"] = "explanation"
-        
-        # প্রোডাক্ট রিকমেন্ডেশন মেসেজ
-        product_name = selected_product.get("name", "")
-        price = selected_product.get("price", 0)
-        
-        recommendation_phrases = [
-            f"আপনার কথাটা শুনে এই option টা সবচেয়ে ভালো match করবে মনে হচ্ছে 👇\n\n✨ **{product_name}**",
-            f"আমার মনে হচ্ছে এটা আপনার জন্য পারফেক্ট হবে 😊\n\n🔥 **{product_name}**",
-            f"অনেক customer আপনার মত need এর জন্য এটা নেয় 👍\n\n🌟 **{product_name}**"
-        ]
-        
-        response = random.choice(recommendation_phrases)
-        self.state["conversation_history"].append({"role": "assistant", "content": response})
-        return response
-    
-    def _handle_explanation(self, message: str) -> str:
-        """ইমোশনাল এক্সপ্লেনেশন দাও"""
-        product = self.state.get("last_recommended")
-        
-        if not product:
-            self.state["step"] = "soft_cta"
-            response = "দুঃখিত, পণ্যটি এখন খুঁজে পাচ্ছি না 😔 অন্য কিছু দেখতে চান?"
-            self.state["conversation_history"].append({"role": "assistant", "content": response})
-            return response
-        
-        # AI দিয়ে ইমোশনাল এক্সপ্লেনেশন জেনারেট করো
-        ai_response = self._get_product_explanation(product, self.state)
-        
-        self.state["step"] = "soft_cta"
-        self.state["conversation_history"].append({"role": "assistant", "content": ai_response})
-        return ai_response
-    
-    def _handle_soft_cta(self, message: str) -> str:
-        """সফট কল টু অ্যাকশন"""
-        message_lower = message.lower()
-        
-        # AI দিয়ে রেসপন্স জেনারেট করো
-        ai_response = self._get_soft_cta_response(message, self.state)
-        
-        self.state["conversation_history"].append({"role": "assistant", "content": ai_response})
-        return ai_response
-    
-    def _handle_objection(self, message: str) -> str:
-        """অবজেকশন হ্যান্ডেল করো"""
-        # AI দিয়ে অবজেকশন হ্যান্ডলিং রেসপন্স জেনারেট করো
-        ai_response = self._get_objection_response(message, self.state)
-        
-        self.state["step"] = "soft_cta"
-        self.state["conversation_history"].append({"role": "assistant", "content": ai_response})
-        return ai_response
-    
-    def _handle_direct_order(self) -> str:
-        """সরাসরি অর্ডার হ্যান্ডেল করো"""
-        product = self.state.get("last_recommended")
-        if product:
-            product_name = product.get("name", "")
+    # Get only in-stock products for quick view
+    in_stock_products = []
+    for product in products:
+        if product.get("in_stock", False) and product.get("stock", 0) > 0:
+            name = product.get("name", "")
             price = product.get("price", 0)
-            
-            order_phrases = [
-                f"একদম! 😊 **{product_name}** এর অর্ডার নিচ্ছি।\n\nদাম: ৳{price:,}\n\nআপনার নাম বলবেন শুরু করতে?",
-                f"বেশ তো! 🫶 **{product_name}** order শুরু করছি।\n\nPrice: ৳{price:,}\n\nYour name please?",
-                f"Perfect! 👍 **{product_name}** এর জন্য order process start করি।\n\nCost: ৳{price:,}\n\nName দিবেন?"
-            ]
-            
-            response = random.choice(order_phrases)
-            self.state["conversation_history"].append({"role": "assistant", "content": response})
-            return response
-        
-        # যদি প্রোডাক্ট না থাকে
-        return "কোন পণ্য সিলেক্ট করা নেই 😔 প্রথমে কিছু দেখে নিন।"
-    
-    def _handle_ai_fallback(self, message: str, page_name: str) -> str:
-        """AI ফলব্যাক রেসপন্স"""
-        ai_response = self._get_ai_response(message, page_name)
-        self.state["conversation_history"].append({"role": "assistant", "content": ai_response})
-        return ai_response
-    
-    def _update_context_from_response(self, message: str):
-        """ইউজারের রেসপন্স থেকে কনটেক্সট আপডেট করো"""
-        message_lower = message.lower()
-        
-        # বয়স ডিটেক্ট করো (গিফটের জন্য)
-        age_pattern = r'(\d+)\s*(বছর|year|yr)'
-        age_match = re.search(age_pattern, message)
-        if age_match:
-            self.state["age"] = age_match.group(1)
-        
-        # বাজেট রেঞ্জ ডিটেক্ট করো
-        budget_patterns = [
-            r'(\d+)\s*(-|থেকে|to)\s*(\d+)',
-            r'(\d+)\s*(হাজার|হা|thousand|k)',
-            r'৳?\s*(\d+)'
-        ]
-        
-        for pattern in budget_patterns:
-            match = re.search(pattern, message)
-            if match:
-                self.state["budget_range"] = message
-                break
-    
-    def _get_ai_response(self, user_message: str, context: str = "") -> str:
-        """AI রেসপন্স জেনারেট করো"""
-        try:
-            api_key = get_groq_key(self.admin_id)
-            if not api_key:
-                return self._get_fallback_response()
-            
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
-            
-            # কনভারসেশন হিস্ট্রি তৈরি করো
-            messages = self._prepare_conversation_messages(user_message, context)
-            
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=250,
-                top_p=0.9
-            )
-            
-            ai_response = response.choices[0].message.content.strip()
-            return ai_response
-            
-        except Exception as e:
-            logger.error(f"AI Response Error in conversation: {str(e)}")
-            return self._get_fallback_response()
-    
-    def _get_product_explanation(self, product: Dict, context: Dict) -> str:
-        """প্রোডাক্টের ইমোশনাল এক্সপ্লেনেশন জেনারেট করো"""
-        try:
-            api_key = get_groq_key(self.admin_id)
-            if not api_key:
-                return self._get_fallback_product_explanation(product)
-            
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
-            
-            product_name = product.get("name", "")
+            stock = product.get("stock", 0)
             description = product.get("description", "")
-            price = product.get("price", 0)
-            features = product.get("features", "")
-            benefits = product.get("benefits", "")
-            
-            customer_type = context.get("customer_type", "personal")
-            
-            system_prompt = f"""তুমি একজন ফ্রেন্ডলি শপ অ্যাসিস্ট্যান্ট। গ্রাহককে প্রোডাক্টের emotional benefits বোঝাও।
-
-নিয়ম:
-1. প্রোডাক্টের technical specs বেশি বলো না
-2. emotional experience ও use cases বলো
-3. ৩-৪ লাইনের মধ্যে বলো
-4. সফট ইমোজি ব্যবহার করো (😊, ✨, 🫶)
-5. দাম প্রাকৃতিকভাবে mention করো
-6. {customer_type} টাইপের ক্রেতার জন্য relevant benefits highlight করো
-
-প্রোডাক্ট: {product_name}
-বিবরণ: {description}
-দাম: ৳{price}
-ফিচার: {features}
-সুবিধা: {benefits}
-
-একটি আকর্ষণীয় emotional explanation দাও:"""
-            
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "এই প্রোডাক্টটা আমার জন্য কেমন হবে?"}
-            ]
-            
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.8,
-                max_tokens=200,
-                top_p=0.9
-            )
-            
-            explanation = response.choices[0].message.content.strip()
-            
-            # দাম যোগ করো যদি AI না যোগে
-            if f"৳{price}" not in explanation and f"{price}" not in explanation:
-                explanation += f"\n\nদাম: ৳{price:,} ✨"
-            
-            return explanation
-            
-        except Exception as e:
-            logger.error(f"Product explanation error: {str(e)}")
-            return self._get_fallback_product_explanation(product)
+            if name:  # Ensure product name is not empty
+                in_stock_products.append(f"• {name} - ৳{price:,} (স্টক: {stock})\n   📝 {description[:80]}...")
     
-    def _get_soft_cta_response(self, user_message: str, context: Dict) -> str:
-        """সফট CTA রেসপন্স জেনারেট করো"""
-        try:
-            api_key = get_groq_key(self.admin_id)
-            if not api_key:
-                return "কেমন লাগলো আপনার? 😊 আগ্রহ থাকলে জানাবেন।"
-            
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
-            
-            product = context.get("last_recommended")
-            product_name = product.get("name", "") if product else ""
-            
-            system_prompt = f"""তুমি একজন ফ্রেন্ডলি শপ অ্যাসিস্ট্যান্ট। গ্রাহককে প্রেশার ছাড়া gently invite করো।
-
-নিয়ম:
-1. কখনো pressure দিও না
-2. open-ended প্রশ্ন করো
-3. ২-৩ লাইনের মধ্যে বলো
-4. সফট ইমোজি ব্যবহার করো (😊, 🫶, 👍)
-5. গ্রাহককে control দাও
-6. alternative option এর mention করো
-
-গ্রাহক বলেছেন: "{user_message}"
-প্রোডাক্ট: {product_name}
-
-একটি gentle, pressure-free response দাও:"""
-            
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ]
-            
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=150,
-                top_p=0.9
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            logger.error(f"Soft CTA error: {str(e)}")
-            return "কেমন লাগলো? 😊 আগ্রহ থাকলে জানাবেন।"
+    if not in_stock_products:
+        return "দুঃখিত, এখন স্টকে কোনো পণ্য নেই। দয়া করে কিছুক্ষণ পরে চেষ্টা করুন।"
     
-    def _get_objection_response(self, user_message: str, context: Dict) -> str:
-        """অবজেকশন হ্যান্ডলিং রেসপন্স জেনারেট করো"""
-        try:
-            api_key = get_groq_key(self.admin_id)
-            if not api_key:
-                return "বুঝতে পারছি 🫶 চিন্তা করবেন না, আপনার time নিয়ে decide করুন।"
-            
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
-            
-            system_prompt = """তুমি একজন এমপ্যাথেটিক শপ অ্যাসিস্ট্যান্ট। গ্রাহকের concerns validate করো এবং gently reassure করো।
-
-নিয়ম:
-1. প্রথমে তাদের concern acknowledge করো
-2. কখনো argue করো না
-3. positive aspects gently mention করো
-4. সফট ইমোজি ব্যবহার করো (🫶, 😊, 👍)
-5. ৩-৪ লাইনের মধ্যে বলো
-6. গ্রাহককে comfortable feeling দাও
-
-গ্রাহকের concern: """
-            
-            messages = [
-                {"role": "system", "content": system_prompt + user_message},
-                {"role": "user", "content": "এই concern টা handle করো"}
-            ]
-            
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=200,
-                top_p=0.9
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            logger.error(f"Objection handling error: {str(e)}")
-            return "বুঝতে পারছি 🫶 আপনার decision আমি respect করি 😊"
+    response = "🛒 **স্টকে থাকা পণ্য:**\n\n"
+    response += "\n\n".join(in_stock_products[:6])  # Show max 6 products with descriptions
     
-    def _prepare_conversation_messages(self, user_message: str, page_name: str) -> List[Dict]:
-        """কনভারসেশন মেসেজ প্রিপেয়ার করো"""
-        # বেইস সিস্টেম প্রম্পট
-        system_prompt = f"""তুমি {BOT_NAME}, একজন ফ্রেন্ডলি, হিউম্যান-লাইক সেলস অ্যাসিস্ট্যান্ট {page_name}-এর জন্য।
-
-IMPORTANT BEHAVIOR RULES:
-1. কখনো robotic বা systematic sound করো না
-2. কথোপকথন natural এবং casual রাখো
-3. শুধুমাত্র ONE question করো একবারে
-4. গ্রাহকের intent বুঝে নাও আগে selling শুরু করার
-5. emotions, use-cases, এবং benefits দিয়ে sell করো - শুধু features দিয়ে না
-6. গ্রাহককে overwhelm করো না too many options দিয়ে
-7. সবসময় গ্রাহকের control এবং comfort maintain করো
-
-TONE & STYLE:
-- Friendly, caring, এবং conversational
-- হালকা ইমোজি occasionally ব্যবহার করো (🙂✨👍) but not too many
-- এই phrases ব্যবহার করো: "বুঝলাম 😊", "ভালো প্রশ্ন 👍", "একটু বুঝে নিচ্ছি...", "আমি এখানেই আছি, চিন্তা নেই"
-
-কখনো বলো না:
-- "Please select a category"
-- "ক্যাটাগরি দেখতে ক্যাটাগরি লিখুন"
-- "YES লিখুন / 1 চাপুন"
-- menus দেখাবে না unless গ্রাহক asks
-
-গ্রাহকের শেষ মেসেজ: "{user_message}"
-
-তুমি:"""
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        # কনভারসেশন হিস্ট্রি যোগ করো (শেষের ৪টা মেসেজ)
-        history = self.state.get("conversation_history", [])
-        for msg in history[-4:]:  # শেষের ৪টা মেসেজ
-            messages.append(msg)
-        
-        return messages
+    if len(in_stock_products) > 6:
+        response += f"\n\n... আরও {len(in_stock_products) - 6}টি পণ্য স্টকে আছে"
     
-    def _get_fallback_response(self) -> str:
-        """ফলব্যাক রেসপন্স"""
-        fallbacks = [
-            "একটু ভাবছি আপনার কথাটা নিয়ে... 😊 আসলে আমার মনে হচ্ছে আপনি যা খুঁজছেন, তা আমাদের কাছে আছে। একটু বলবেন কী ধরনের জিনিস?",
-            "বুঝলাম... 🫶 আমি আপনাকে সেরা option টা suggest করতে চাই। একটু বলবেন, আপনার priority কী?",
-            "আমি এখানেই আছি, চিন্তা নেই 🙂 আপনার কী দরকার সেটা একটু clear করলে আমি ভালোভাবে help করতে পারব।"
-        ]
-        return random.choice(fallbacks)
+    response += "\n\n🔍 নির্দিষ্ট পণ্যের বিস্তারিত জানতে পণ্যের নাম লিখুন\n📂 ক্যাটাগরি অনুযায়ী দেখতে 'ক্যাটাগরি' লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন"
+    return response
+
+def show_categories(admin_id: str, customer_id: str) -> str:
+    """ক্যাটাগরি দেখাও"""
+    categories = get_all_categories(admin_id)
     
-    def _get_fallback_product_explanation(self, product: Dict) -> str:
-        """ফলব্যাক প্রোডাক্ট এক্সপ্লেনেশন"""
-        product_name = product.get("name", "")
+    if not categories:
+        return "দুঃখিত, এখন কোনো ক্যাটাগরি পাওয়া যাচ্ছে না।"
+    
+    response = "📂 **ক্যাটাগরি তালিকা:**\n\n"
+    for i, category in enumerate(categories[:10], 1):  # Max 10 categories
+        response += f"{i}. {category}\n"
+    
+    response += "\nকোন ক্যাটাগরির পণ্য দেখতে চান? ক্যাটাগরির নাম লিখুন।"
+    
+    # Start category browsing session
+    _category_sessions[f"cat_{admin_id}_{customer_id}"] = {
+        "categories": categories,
+        "step": "waiting_for_category"
+    }
+    
+    return response
+
+def show_products_by_category(admin_id: str, customer_id: str, category_name: str) -> str:
+    """নির্দিষ্ট ক্যাটাগরির পণ্য দেখাও"""
+    products = get_products_with_details(admin_id)
+    
+    if not products:
+        return "দুঃখিত, এখন কোনো পণ্য পাওয়া যাচ্ছে না।"
+    
+    # Filter products by category
+    category_products = []
+    for product in products:
+        if product.get("category", "").strip().lower() == category_name.lower():
+            if product.get("in_stock", False) and product.get("stock", 0) > 0:
+                category_products.append(product)
+    
+    if not category_products:
+        return f"দুঃখিত, '{category_name}' ক্যাটাগরিতে এখন কোনো পণ্য স্টকে নেই।\n\nঅন্য ক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন।"
+    
+    response = f"🛍️ **{category_name} ক্যাটাগরির পণ্য:**\n\n"
+    
+    for i, product in enumerate(category_products[:8], 1):  # Max 8 products per category
+        name = product.get("name", "")
         price = product.get("price", 0)
-        description = product.get("description", "")
-        
-        explanations = [
-            f"এই জিনিসটা থাকলে আপনার daily routine অনেক সহজ হবে 😊 ব্যবহারে comfortable, দেখতেও stylish ✨\n\nদাম: ৳{price:,}",
-            f"{product_name} নিলে long-term এ ভালো value পাবেন 👍 quality ভালো, maintenance কম 🫶\n\nPrice: ৳{price:,}",
-            f"এই option টা অনেকের favorite কারণ practical ও aesthetic both 😌 {description[:80]}...\n\nCost: ৳{price:,} ✨"
-        ]
-        
-        return random.choice(explanations)
+        stock = product.get("stock", 0)
+        description = product.get("description", "")[:60]
+        response += f"{i}. {name} - ৳{price:,} (স্টক: {stock})\n   {description}...\n\n"
     
-    def cleanup(self):
-        """কনভারসেশন ক্লিনআপ"""
-        if self.state_key in _conversation_states:
-            del _conversation_states[self.state_key]
+    response += "কোন পণ্যের বিস্তারিত জানতে চান? পণ্যের নাম বা নম্বর লিখুন।\n\n"
+    response += "🔙 অন্য ক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\n🛒 অর্ডার দিতে 'অর্ডার' লিখুন"
+    
+    # Start product browsing session
+    _product_browsing_sessions[f"prod_{admin_id}_{customer_id}"] = {
+        "category": category_name,
+        "products": category_products,
+        "step": "waiting_for_product"
+    }
+    
+    return response
+
+def get_product_details_response(product: Dict) -> str:
+    """পণ্যের আকর্ষণীয় বিবরণ দাও"""
+    name = product.get("name", "")
+    price = product.get("price", 0)
+    stock = product.get("stock", 0)
+    in_stock = product.get("in_stock", False)
+    description = product.get("description", "উচ্চমানের পণ্য")
+    category = product.get("category", "সাধারণ")
+    features = product.get("features", "উচ্চমানের উপকরণ, টেকসই নির্মাণ")
+    benefits = product.get("benefits", "দীর্ঘস্থায়ী ব্যবহার, মানসম্মত ও সাশ্রয়ী")
+    
+    # Create attractive description based on available info
+    attractive_lines = [
+        f"✨ **{name}** ✨\n",
+        f"🏷️ ক্যাটাগরি: {category}\n",
+        f"💰 বিশেষ দাম: ৳{price:,}\n",
+        f"📦 উপলব্ধতা: {'✅ স্টকে আছে' if in_stock and stock > 0 else '⏳ শীঘ্রই আসছে'}\n"
+    ]
+    
+    if in_stock and stock > 0:
+        attractive_lines.append(f"📊 স্টক অবস্থা: {stock} পিস\n")
+    
+    attractive_lines.append(f"\n📝 **পণ্যের বিবরণ:**\n{description}\n")
+    
+    attractive_lines.append(f"\n🌟 **বিশেষ বৈশিষ্ট্য:**\n{features}\n")
+    
+    attractive_lines.append(f"\n🎯 **আপনার সুবিধা:**\n{benefits}\n")
+    
+    # Add some motivational lines
+    motivational = [
+        "\n💎 **কেন এই পণ্য কিনবেন?**",
+        "✅ ১০০% অরিজিনাল ও গ্যারান্টিযুক্ত",
+        "✅ হোম ডেলিভারি সার্ভিস উপলব্ধ",
+        "✅ সহজ পেমেন্ট সিস্টেম",
+        "✅ ৭ দিনের রিটার্ন পলিসি"
+    ]
+    
+    attractive_lines.extend(motivational)
+    
+    attractive_lines.append(f"\n🛒 **অর্ডার করতে:** 'অর্ডার' লিখুন")
+    
+    if stock > 0:
+        attractive_lines.append(f"📞 **দ্রুত অর্ডার:** সরাসরি কল করুন")
+    
+    attractive_lines.append(f"🔙 **অন্য পণ্য দেখতে:** পণ্যের নাম লিখুন")
+    
+    return "\n".join(attractive_lines)
+
+def check_price_query(text: str, products: List[Dict]) -> Tuple[bool, Optional[str]]:
+    """চেক করো গ্রাহক দাম জানতে চাচ্ছে কিনা"""
+    price_keywords = ['দাম', 'price', 'কত', 'কোস্ট', 'cost', 'টাকা', 'মূল্য']
+    text_lower = text.lower()
+    
+    # First check if it's a general price query
+    if any(keyword in text_lower for keyword in price_keywords):
+        # Check if specific product is mentioned
+        for product in products:
+            product_name = product.get("name", "").lower().strip()
+            if product_name and product_name in text_lower:
+                return True, get_product_details_response(product)
+        
+        # If no specific product mentioned, show all products
+        return True, None
+    
+    return False, None
+
+def find_product_in_query(text: str, products: List[Dict]) -> Optional[Dict]:
+    """কোয়েরিতে পণ্য খুঁজে বের করো"""
+    text_lower = text.lower().strip()
+    
+    # প্রথমে সরাসরি ম্যাচ চেক করো
+    for product in products:
+        product_name = product.get("name", "").lower().strip()
+        
+        if not product_name:
+            continue
+            
+        # সরাসরি পণ্যের নাম থাকলে
+        if product_name in text_lower or text_lower in product_name:
+            return product
+        
+        # পণ্যের নামের শব্দগুলো চেক করো
+        product_words = product_name.split()
+        for word in product_words:
+            if len(word) > 3 and word in text_lower:
+                return product
+    
+    return None
+
+def check_category_browsing(admin_id: str, customer_id: str, user_message: str) -> Optional[str]:
+    """চেক করো গ্রাহক ক্যাটাগরি ব্রাউজিং করছে কিনা"""
+    session_key = f"cat_{admin_id}_{customer_id}"
+    
+    if session_key in _category_sessions:
+        session = _category_sessions[session_key]
+        
+        if session["step"] == "waiting_for_category":
+            categories = session["categories"]
+            user_input = user_message.strip().lower()
+            
+            # Check if input matches any category
+            for category in categories:
+                if category.lower() == user_input:
+                    # Remove category session
+                    del _category_sessions[session_key]
+                    return show_products_by_category(admin_id, customer_id, category)
+            
+            # Check if input is a number
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(categories):
+                    category = categories[idx]
+                    # Remove category session
+                    del _category_sessions[session_key]
+                    return show_products_by_category(admin_id, customer_id, category)
+        
+        # Remove session if not valid
+        del _category_sessions[session_key]
+    
+    return None
+
+def check_product_browsing(admin_id: str, customer_id: str, user_message: str) -> Optional[str]:
+    """চেক করো গ্রাহক পণ্য ব্রাউজিং করছে কিনা"""
+    session_key = f"prod_{admin_id}_{customer_id}"
+    
+    if session_key in _product_browsing_sessions:
+        session = _product_browsing_sessions[session_key]
+        
+        if session["step"] == "waiting_for_product":
+            products = session["products"]
+            user_input = user_message.strip().lower()
+            
+            # Check if input is a number
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(products):
+                    product = products[idx]
+                    # Remove product browsing session
+                    del _product_browsing_sessions[session_key]
+                    return get_product_details_response(product)
+            
+            # Check if input matches any product name
+            for product in products:
+                product_name = product.get("name", "").lower().strip()
+                if product_name and (user_input == product_name or user_input in product_name):
+                    # Remove product browsing session
+                    del _product_browsing_sessions[session_key]
+                    return get_product_details_response(product)
+        
+        # Remove session if not valid
+        del _product_browsing_sessions[session_key]
+    
+    return None
 
 # ================= ORDER SESSION MANAGEMENT =================
 class OrderSession:
@@ -750,17 +392,10 @@ class OrderSession:
         self.products = get_products_with_details(admin_id)
     
     def start_order(self):
-        """Start order collection naturally"""
+        """Start order collection"""
         self.step = 1
         _order_sessions[self.session_id] = self
-        
-        start_phrases = [
-            "একদম, অর্ডার শুরু করছি! 😊 প্রথমে আপনার নামটা বলবেন?",
-            "বেশ তো, অর্ডার নেওয়া যাক 👍 আপনার নাম কী?",
-            "ভালো সিদ্ধান্ত! 🫶 একটু তথ্য নিই—আপনার নাম বলবেন?"
-        ]
-        
-        return random.choice(start_phrases)
+        return "অর্ডার নেওয়া শুরু করছি! প্রথমে আপনার নাম বলুন:"
     
     def process_response(self, user_message: str) -> Tuple[str, bool]:
         """Process user response"""
@@ -769,39 +404,17 @@ class OrderSession:
         if self.step == 1:  # Name
             self.data["name"] = user_message.strip()
             self.step = 2
-            
-            name_phrases = [
-                f"ধন্যবাদ {self.data['name']}! 😊 এখন আপনার ফোন নম্বর দিন (যেমন: 017XXXXXXXX):",
-                f"নামটা ভালো লাগলো! 👍 এখন ফোন নম্বরটা বলবেন?",
-                f"ঠিক আছে {self.data['name']} 🫶 ফোন নম্বরটা একটু দিবেন?"
-            ]
-            return random.choice(name_phrases), False
+            return "ধন্যবাদ! এখন আপনার ফোন নম্বর দিন (যেমন: 017XXXXXXXX):", False
             
         elif self.step == 2:  # Phone
             phone = user_message.strip()
             if self.validate_phone(phone):
                 self.data["phone"] = phone
                 self.step = 3
-                
-                # যদি আগে থেকেই প্রোডাক্ট সিলেক্টেড থাকে
-                if self.data["product"]:
-                    product = self.find_product_by_name(self.data["product"])
-                    if product:
-                        self.step = 4
-                        stock = product.get("stock", 0)
-                        price = product.get("price", 0)
-                        
-                        product_phrases = [
-                            f"ফোন নম্বর সেভ করলাম! 😊\n\n**{product['name']}** এর order continue করছি।\n\nদাম: ৳{price:,}\nস্টক: {stock} পিস\n\nকত পিস চান?",
-                            f"ঠিক আছে! 👍\n\n**{product['name']}** এর জন্য quantity বলবেন?\n\nPrice: ৳{price:,}\nAvailable: {stock} pieces"
-                        ]
-                        return random.choice(product_phrases), False
-                
-                # প্রোডাক্ট সিলেকশনের জন্য AI ব্যবহার করো
-                ai_response = self._get_product_suggestion()
-                return ai_response, False
+                products_text = self.get_available_products()
+                return f"ফোন নম্বর সংরক্ষিত! কোন পণ্য অর্ডার করতে চান?\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
             else:
-                return "দুঃখিত, সঠিক ফোন নম্বর দিন (১১ ডিজিট, যেমন: 01712345678):", False
+                return "দুঃখিত, সঠিক ফোন নম্বর দিন (যেমন: 017XXXXXXXX):", False
                 
         elif self.step == 3:  # Product
             selected_product = self.find_product(user_message)
@@ -811,15 +424,12 @@ class OrderSession:
                 self.step = 4
                 stock = selected_product.get("stock", 0)
                 price = selected_product.get("price", 0)
-                
-                selection_phrases = [
-                    f"✅ **{selected_product['name']}** নির্বাচিত!\n\n💰 দাম: ৳{price:,}\n📦 স্টক: {stock} পিস\n\nকত পিস চান?",
-                    f"একদম! 👍 **{selected_product['name']}** তো ভালো choice!\n\nPrice: ৳{price:,}\nAvailable: {stock}\n\nQuantity কত হবে?"
-                ]
-                return random.choice(selection_phrases), False
+                description = selected_product.get("description", "")
+                features = selected_product.get("features", "")
+                return f"✅ **{selected_product['name']}** নির্বাচিত!\n\n💰 দাম: ৳{price:,}\n📝 বিবরণ: {description}\n🌟 বৈশিষ্ট্য: {features}\n\nকত পিস চান? (স্টকে আছে: {stock} পিস):", False
             else:
-                products_text = self._get_available_products_formatted()
-                return f"পণ্যটি খুঁজে পাইনি 😔\n\n{products_text}\n\nআবার চেষ্টা করুন:", False
+                products_text = self.get_available_products()
+                return f"পণ্যটি খুঁজে পাইনি। আবার চেষ্টা করুন:\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
                 
         elif self.step == 4:  # Quantity
             if user_message.isdigit():
@@ -833,14 +443,9 @@ class OrderSession:
                             price = product.get("price", 0)
                             self.data["total"] = price * quantity
                             self.step = 5
-                            
-                            quantity_phrases = [
-                                f"✅ {quantity} পিস ঠিক আছে! 😊\n💰 মোট মূল্য: ৳{self.data['total']:,}\n\nএখন ডেলিভারি ঠিকানা দিন (বিস্তারিত):",
-                                f"{quantity} pieces noted! 👍\nTotal: ৳{self.data['total']:,}\n\nএখন delivery address বলবেন?"
-                            ]
-                            return random.choice(quantity_phrases), False
+                            return f"✅ {quantity} পিস নির্বাচিত!\n💰 মোট মূল্য: ৳{self.data['total']:,}\n\nএখন আপনার ডেলিভারি ঠিকানা দিন (বিস্তারিত):", False
                         else:
-                            return f"দুঃখিত, স্টকে মাত্র {stock} পিস আছে 😔 কম সংখ্যক দিন:", False
+                            return f"দুঃখিত, স্টকে মাত্র {stock} পিস আছে। কম সংখ্যক দিন:", False
                 else:
                     return "দুঃখিত, ১ বা তার বেশি সংখ্যা দিন:", False
             else:
@@ -850,118 +455,45 @@ class OrderSession:
             self.data["address"] = user_message.strip()
             self.step = 6
             summary = self.get_order_summary()
-            
-            summary_phrases = [
-                f"ঠিকানা সংরক্ষিত! 😊\n\n{summary}\n\nঅর্ডার কনফার্ম করতে 'confirm' লিখুন 🫶",
-                f"Address saved! 👍\n\n{summary}\n\nConfirmation এর জন্য 'confirm' লিখুন 😊"
-            ]
-            return random.choice(summary_phrases), False
+            return f"ঠিকানা সংরক্ষিত!\n\n{summary}\n\nঅর্ডার কনফার্ম করতে শুধুমাত্র 'confirm' লিখুন।\nঅন্য কিছু লিখলে অর্ডার বাতিল হবে।", False
             
         elif self.step == 6:  # Confirm
             response_lower = user_message.lower().strip()
-            
+            # শুধুমাত্র 'confirm' লিখলেই অর্ডার কনফার্ম হবে
             if response_lower == 'confirm':
                 order_saved = self.save_order()
                 if order_saved:
                     completed = True
                     order_id = self.data.get("order_id", "")
-                    
-                    success_phrases = [
-                        f"✅ অর্ডার কনফার্ম্ড! 😊\n\nOrder ID: {order_id}\nআমরা শীঘ্রই আপনার সাথে যোগাযোগ করব 🫶\nধন্যবাদ!",
-                        f"🎉 Order confirmed successfully! 👍\n\nID: {order_id}\nআমরা contact করব very soon 😊\nThank you!",
-                        f"✅ Perfect! Order placed 🫶\n\nReference: {order_id}\nOur team will contact you shortly 😊\nঅনেক ধন্যবাদ!"
-                    ]
-                    return random.choice(success_phrases), True
+                    return f"✅ অর্ডার সফলভাবে কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: {order_id}\n\nআমরা শীঘ্রই আপনার সাথে যোগাযোগ করব। ধন্যবাদ! 😊\n\nঅন্যান্য পণ্য দেখতে 'ক্যাটাগরি' লিখুন।", True
                 else:
-                    return "❌ অর্ডার সেভ করতে সমস্যা হয়েছে 😔 দয়া করে আবার চেষ্টা করুন।", True
+                    return "❌ অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।", True
             else:
                 completed = True
-                cancel_phrases = [
-                    "অর্ডার বাতিল করা হয়েছে 😊 যখন ইচ্ছা হবে আবার অর্ডার দিতে পারেন 🫶",
-                    "Order cancelled 👍 No problem, আপনি যখন ready হবেন আবার বলবেন 😊",
-                    "ঠিক আছে, order cancel করলাম 🫶 প্রয়োজনে আবার জানাবেন ✨"
-                ]
-                return random.choice(cancel_phrases), True
+                return "অর্ডার বাতিল হয়েছে। আবার অর্ডার দিতে 'অর্ডার' লিখুন।", True
         
-        return "কিছু সমস্যা হয়েছে 😔 আবার চেষ্টা করুন।", True
-    
-    def _get_product_suggestion(self) -> str:
-        """AI দিয়ে প্রোডাক্ট সাজেশন জেনারেট করো"""
-        try:
-            api_key = get_groq_key(self.admin_id)
-            if not api_key:
-                return self._get_available_products_formatted()
-            
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
-            
-            # available products এর তালিকা তৈরি করো
-            available_products = []
-            for product in self.products:
-                if product.get("in_stock", False) and product.get("stock", 0) > 0:
-                    name = product.get("name", "").strip()
-                    price = product.get("price", 0)
-                    description = product.get("description", "")[:60]
-                    if name:
-                        available_products.append(f"- {name} (৳{price:,}): {description}")
-            
-            if not available_products:
-                return "দুঃখিত, এখন কোনো পণ্য স্টকে নেই 😔"
-            
-            products_text = "\n".join(available_products[:5])
-            
-            system_prompt = f"""তুমি একজন শপ অ্যাসিস্ট্যান্ট। গ্রাহককে প্রোডাক্ট সাজেশন দাও naturally।
-
-নিয়ম:
-1. ২-৩ লাইনের মধ্যে বলো
-2. friendly tone ব্যবহার করো
-3. কখনো overwhelming list দেখাবে না
-4. গ্রাহককে choose করতে invite করো
-5. ইমোজি ব্যবহার করো (😊, 👍)
-
-Available products:
-{products_text}
-
-একটি natural product suggestion দাও:"""
-            
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "কোন পণ্য নেবো?"}
-            ]
-            
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=150,
-                top_p=0.9
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            logger.error(f"Product suggestion error: {str(e)}")
-            return self._get_available_products_formatted()
-    
-    def _get_available_products_formatted(self) -> str:
-        """Get available products formatted"""
-        available = []
-        for product in self.products:
-            if product.get("in_stock", False) and product.get("stock", 0) > 0:
-                name = product.get("name", "").strip()
-                if name:
-                    price = product.get("price", 0)
-                    stock = product.get("stock", 0)
-                    description = product.get("description", "")[:50]
-                    available.append(f"• {name} - ৳{price:,} (স্টক: {stock})\n  {description}...")
-        
-        if available:
-            return "স্টকে থাকা পণ্য:\n\n" + "\n\n".join(available[:4])
-        return "দুঃখিত, এখন কোনো পণ্য স্টকে নেই 😔"
+        return "কিছু সমস্যা হয়েছে। আবার চেষ্টা করুন।", True
     
     def validate_phone(self, phone: str) -> bool:
         """Validate phone number"""
         phone_clean = re.sub(r'\D', '', phone)
         return len(phone_clean) == 11 and phone_clean.startswith('01')
+    
+    def get_available_products(self) -> str:
+        """Get available products"""
+        available = []
+        for product in self.products:
+            if product.get("in_stock", False) and product.get("stock", 0) > 0:
+                name = product.get("name", "").strip()
+                if name:  # Check if name is not empty
+                    price = product.get("price", 0)
+                    stock = product.get("stock", 0)
+                    description = product.get("description", "")[:50]
+                    available.append(f"- {name} (৳{price:,}, স্টক: {stock})\n  {description}...")
+        
+        if available:
+            return "স্টকে থাকা পণ্য:\n\n" + "\n\n".join(available[:5])
+        return "দুঃখিত, এখন কোনো পণ্য স্টকে নেই।"
     
     def find_product(self, query: str) -> Optional[Dict]:
         """Find product"""
@@ -1078,6 +610,60 @@ def get_groq_key(admin_id: str) -> Optional[str]:
         logger.error(f"Get Groq key error: {str(e)}")
         return None
 
+def get_products(admin_id: str) -> List[Dict]:
+    """Get products from database"""
+    cache_key = f"products_{admin_id}"
+    
+    if cache_key in _product_cache:
+        return _product_cache[cache_key]
+    
+    try:
+        response = supabase.table("products")\
+            .select("*")\
+            .eq("user_id", admin_id)\
+            .order("created_at", desc=True)\
+            .execute()
+        
+        products = response.data if response.data else []
+        _product_cache[cache_key] = products
+        return products
+        
+    except Exception as e:
+        logger.error(f"Get products error: {str(e)}")
+        return []
+
+def detect_language(text: str) -> str:
+    """Detect language"""
+    if not text:
+        return 'bangla'
+    
+    text_lower = text.lower()
+    bangla_pattern = re.compile(r'[\u0980-\u09FF]')
+    
+    if bangla_pattern.search(text):
+        return 'bangla'
+    
+    banglish_keywords = ['ki', 'kemon', 'achen', 'acha', 'valo', 'kothay', 'kot', 'dam']
+    if any(keyword in text_lower for keyword in banglish_keywords):
+        return 'bangla'
+    
+    return 'english'
+
+def check_order_keywords(text: str) -> bool:
+    """Check order keywords"""
+    order_keywords = ['অর্ডার', 'order', 'কিনব', 'buy', 'নিব', 'চাই', 'পurchase', 'খরিদ']
+    return any(keyword in text.lower() for keyword in order_keywords)
+
+def check_category_keywords(text: str) -> bool:
+    """Check category keywords"""
+    category_keywords = ['ক্যাটাগরি', 'category', 'বিভাগ', 'ধরন', 'type', 'ক্যাটাগরী']
+    return any(keyword in text.lower() for keyword in order_keywords)
+
+def check_products_keywords(text: str) -> bool:
+    """Check products keywords"""
+    products_keywords = ['পণ্য', 'products', 'সব পণ্য', 'সকল পণ্য', 'product', 'all products']
+    return any(keyword in text.lower() for keyword in order_keywords)
+
 def send_facebook_message(page_token: str, customer_id: str, message_text: str):
     """Send Facebook message"""
     try:
@@ -1116,10 +702,22 @@ def typing_off(token: str, recipient_id: str) -> bool:
     except:
         return False
 
-# ================= MAIN RESPONSE GENERATOR =================
+# ================= AI RESPONSE =================
 def generate_ai_response(admin_id: str, user_message: str, customer_id: str, page_name: str = "আমাদের দোকান") -> str:
-    """Generate natural human-like response"""
     try:
+        # Check if first message
+        first_message = is_first_message(admin_id, customer_id)
+        
+        # Detect language
+        language = detect_language(user_message)
+        
+        # Get products with details
+        products = get_products_with_details(admin_id)
+        
+        # Handle first message - শুধু গ্রিটিং
+        if first_message:
+            return get_welcome_response(page_name, language)
+        
         # Check if in order session
         session_id = f"order_{admin_id}_{customer_id}"
         if session_id in _order_sessions:
@@ -1127,28 +725,55 @@ def generate_ai_response(admin_id: str, user_message: str, customer_id: str, pag
             response, completed = session.process_response(user_message)
             if completed:
                 session.cancel()
-                # কনভারসেশন স্টেট ক্লিনআপ করো
-                conv_key = f"conv_{admin_id}_{customer_id}"
-                if conv_key in _conversation_states:
-                    del _conversation_states[conv_key]
             return response
         
-        # ন্যাচারাল কনভারসেশন ম্যানেজার ব্যবহার করো
-        conv_manager = NaturalConversationManager(admin_id, customer_id)
-        response = conv_manager.process_message(user_message, page_name)
+        # Check category browsing
+        category_response = check_category_browsing(admin_id, customer_id, user_message)
+        if category_response:
+            return category_response
         
-        return response
+        # Check product browsing
+        product_browse_response = check_product_browsing(admin_id, customer_id, user_message)
+        if product_browse_response:
+            return product_browse_response
+        
+        # Check if user wants to see categories
+        if check_category_keywords(user_message):
+            return show_categories(admin_id, customer_id)
+        
+        # Check if user wants to see all products
+        if check_products_keywords(user_message):
+            return get_all_products_formatted(admin_id)
+        
+        # Check specific product query or inquiry
+        product = find_product_in_query(user_message, products)
+        if product:
+            # সরাসরি ডাটাবেস থেকে প্রোডাক্ট ডিটেইলস দেখাবে
+            return get_product_details_response(product)
+        
+        # Check price query
+        is_price_query, price_response = check_price_query(user_message, products)
+        if is_price_query:
+            if price_response:
+                return price_response
+            else:
+                # General price query - show all products
+                return get_all_products_formatted(admin_id)
+        
+        # Check order request
+        if check_order_keywords(user_message):
+            session = OrderSession(admin_id, customer_id)
+            return session.start_order()
+        
+        # যদি উপরের কোনোটিই না মেলে, শুধু সাধারণ উত্তর দেবে
+        if language == 'bangla':
+            return "দুঃখিত, বুঝতে পারিনি। আপনি কী করতে চান?\n\n• ক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\n• সব পণ্য দেখতে 'পণ্য' লিখুন\n• অর্ডার দিতে 'অর্ডার' লিখুন\n• নির্দিষ্ট পণ্যের নাম লিখে তার সম্পর্কে জানুন"
+        else:
+            return "Sorry, I didn't understand. What would you like to do?\n\n• Type 'category' to see categories\n• Type 'products' to see all products\n• Type 'order' to place order\n• Type product name to know about it"
         
     except Exception as e:
         logger.error(f"AI Response Error: {str(e)}")
-        
-        error_responses = [
-            "ওহ, একটু সমস্যা হয়েছে 😔 আপনি কী বলছিলেন? আবার একটু বলবেন?",
-            "দুঃখিত, একটু technical issue 😊 আবার চেষ্টা করি... আপনি কী বলতে চেয়েছিলেন?",
-            "আমার side এ একটু problem 🫶 আপনি আবার বলবেন? ধন্যবাদ 😊"
-        ]
-        
-        return random.choice(error_responses)
+        return "দুঃখিত, সমস্যা হয়েছে। আবার চেষ্টা করুন।\n\nক্যাটাগরি দেখতে 'ক্যাটাগরি' লিখুন\nসব পণ্য দেখতে 'পণ্য' লিখুন"
 
 # ================= WEBHOOK ROUTES =================
 @app.route("/webhook", methods=["GET"])
