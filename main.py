@@ -164,6 +164,18 @@ class OrderSession:
         msg = user_message.strip()
         self.products = get_products_with_details(self.admin_id)
 
+        # --- Context Handling (মাঝপথে প্রশ্ন করলে) ---
+        # যদি ইনপুটে প্রশ্নবোধক চিহ্ন থাকে বা কিছু নির্দিষ্ট কি-ওয়ার্ড থাকে
+        if any(word in msg for word in ["?", "কই", "কি", "কেন", "হবে", "আছে"]):
+            faq = find_faq(self.admin_id, msg)
+            next_step_prompt = self._get_next_step_reminder()
+            if faq:
+                return f"{faq}\n\nঅর্ডারটি সম্পন্ন করতে এখন আপনার {next_step_prompt} বলুন:", False
+            
+            # FAQ তে না থাকলে AI রিপ্লাই জেনারেট করা
+            ai_reply = generate_ai_reply(self.admin_id, self.customer_id, msg)
+            return f"{ai_reply}\n\nঅর্ডারটি সম্পন্ন করতে আপনার {next_step_prompt} বলুন:", False
+
         if self.step == 1:
             self.data["name"] = msg
             self.step = 2
@@ -233,6 +245,13 @@ class OrderSession:
 
         return "দুঃখিত, আমি বুঝতে পারছি না।", True
 
+    def _get_next_step_reminder(self):
+        prompts = {
+            1: "নাম", 2: "ফোন নম্বর", 3: "পণ্যের নাম", 4: "পিস বা পরিমাণ", 
+            5: "পণ্যের নাম অথবা 'done'", 6: "ডেলিভারি চার্জ", 7: "ঠিকানা", 8: "'confirm'"
+        }
+        return prompts.get(self.step, "তথ্য")
+
     def find_product(self, query):
         for p in self.products:
             if query.lower() in p['name'].lower() and p.get('stock', 0) > 0:
@@ -259,7 +278,6 @@ class OrderSession:
 
     def save_order_db(self) -> bool:
         try:
-            # পণ্যগুলোর নাম এবং মোট পরিমাণ ক্যালকুলেট করা
             all_product_names = ", ".join([item['name'] for item in self.data['items']])
             total_quantity = sum([item['qty'] for item in self.data['items']])
 
@@ -297,7 +315,6 @@ def generate_ai_reply(admin_id, customer_id, user_msg):
         business = get_business_settings(admin_id)
         business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
         if business:
-            # এখানে contact_number কলামটি যোগ করা হয়েছে
             business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nযোগাযোগ নম্বর: {business.get('contact_number')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
         
         raw_memory = get_chat_memory(admin_id, customer_id)
