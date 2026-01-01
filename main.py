@@ -29,7 +29,6 @@ def get_session_from_db(session_id: str) -> Optional["OrderSession"]:
         res = supabase.table("order_sessions").select("*").eq("id", session_id).execute()
         if res.data:
             row = res.data[0]
-            # সেশন ডাটায় admin_id এবং user_id এর সামঞ্জস্য রাখা হয়েছে
             admin_id = row.get('user_id') or row.get('admin_id')
             session = OrderSession(admin_id, row['customer_id'])
             session.step = row['step']
@@ -98,7 +97,6 @@ def find_faq(admin_id: str, user_msg: str) -> Optional[str]:
         faqs = res.data or []
         best_ratio = 0
         best_answer = None
-        
         for faq in faqs:
             ratio = SequenceMatcher(None, user_msg.lower(), faq["question"].lower()).ratio()
             if ratio > best_ratio and ratio > 0.65:
@@ -160,7 +158,7 @@ class OrderSession:
 
     def start_order(self):
         self.step = 1
-        return "জি, আমি সিমন্ত (Simanto)। অর্ডার নিতে সাহায্য করছি। প্রথমে আপনার নাম বলুন:"
+        return "জি, আমি Simanto, অর্ডার নিতে সাহায্য করছি। প্রথমে আপনার নাম বলুন:"
 
     def process_response(self, user_message: str) -> Tuple[str, bool]:
         msg = user_message.strip()
@@ -229,7 +227,7 @@ class OrderSession:
         elif self.step == 8:
             if msg.lower() == 'confirm':
                 if self.save_order_db():
-                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। সিমন্ত (Simanto) শীঘ্রই আপনার সাথে যোগাযোগ করবে।", True
+                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। আমরা শীঘ্রই আপনার সাথে যোগাযোগ করবে।", True
                 return "দুঃখিত, অর্ডার সেভ করার সময় কারিগরি সমস্যা হয়েছে।", True
             return "অর্ডার বাতিল হয়েছে। পুনরায় অর্ডার দিতে 'অর্ডার' লিখুন।", True
 
@@ -261,14 +259,19 @@ class OrderSession:
 
     def save_order_db(self) -> bool:
         try:
+            # পণ্যগুলোর নাম এবং মোট পরিমাণ ক্যালকুলেট করা
+            all_product_names = ", ".join([item['name'] for item in self.data['items']])
+            total_quantity = sum([item['qty'] for item in self.data['items']])
+
             res = supabase.table("orders").insert({
                 "user_id": self.admin_id, 
                 "customer_name": self.data["name"],
                 "customer_phone": self.data["phone"], 
+                "product": all_product_names, 
+                "quantity": total_quantity, 
                 "address": self.data["address"],
                 "delivery_charge": self.data["delivery_charge"],
                 "total": self.data["total"], 
-                "items": self.data["items"],
                 "status": "pending", 
                 "created_at": datetime.utcnow().isoformat()
             }).execute()
@@ -282,7 +285,6 @@ def detect_intent_nlp(admin_id, text):
     try:
         res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
         if not res.data: return False
-        
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=res.data[0]["groq_api_key"])
         prompt = f"Does the user want to order/buy something? Respond with 'YES' or 'NO' only. Input: {text}"
         comp = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
@@ -293,36 +295,23 @@ def detect_intent_nlp(admin_id, text):
 def generate_ai_reply(admin_id, customer_id, user_msg):
     try:
         business = get_business_settings(admin_id)
-        # শুদ্ধ প্রমিত বাংলার প্রম্পট
         business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
         if business:
-            business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
-
-        # মেমোরি লোড এবং ক্লিনজিং (ভ্যালিডেশন)
+            # এখানে contact_number কলামটি যোগ করা হয়েছে
+            business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nযোগাযোগ নম্বর: {business.get('contact_number')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
+        
         raw_memory = get_chat_memory(admin_id, customer_id)
         valid_memory = [m for m in raw_memory if isinstance(m, dict) and 'role' in m and 'content' in m]
-        
         api_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
-        if not api_res.data:
-            return "হ্যালো আমি Simanto, আমাদের সিস্টেমে কিছু সমস্যা হয়েছে।"
-            
+        if not api_res.data: return "হ্যালো আমি Simanto, আমাদের সিস্টেমে কিছু সমস্যা হয়েছে।"
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_res.data[0]["groq_api_key"])
-        
         products = get_products_with_details(admin_id)
         product_text = "\n".join([f"- {p.get('name')} | ৳{p.get('price')}" for p in products if p.get("stock", 0) > 0])
-
-        messages = [
-            {
-                "role": "system", 
-                "content": f"{business_context}\nপণ্যের তালিকা:\n{product_text}\n\nগুরুত্বপূর্ণ: পণ্যের নামগুলি হুবহু ব্যবহার করবে।"
-            }
-        ]
+        messages = [{"role": "system", "content": f"{business_context}\nপণ্যের তালিকা:\n{product_text}\n\nগুরুত্বপূর্ণ: পণ্যের নামগুলি হুবহু ব্যবহার করবে।"}]
         messages.extend(valid_memory)
         messages.append({"role": "user", "content": user_msg})
-
         res = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, temperature=0.3)
         reply = res.choices[0].message.content.strip()
-
         new_memory = valid_memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         save_chat_memory(admin_id, customer_id, new_memory[-10:])
         return reply
@@ -338,36 +327,27 @@ def webhook():
         page_id = entry.get("id")
         page = get_page_client(page_id)
         if not page: continue
-        
         token, admin_id = page["page_access_token"], page["user_id"]
-
         for msg_event in entry.get("messaging", []):
             sender = msg_event["sender"]["id"]
             text = msg_event.get("message", {}).get("text")
             if not text: continue
-
             session_id = f"order_{admin_id}_{sender}"
             current_session = get_session_from_db(session_id)
-
             if current_session:
                 reply, done = current_session.process_response(text)
                 send_message(token, sender, reply)
                 if done: delete_session_from_db(session_id)
                 else: save_session_to_db(current_session)
                 continue
-
             if detect_intent_nlp(admin_id, text):
                 new_session = OrderSession(admin_id, sender)
                 save_session_to_db(new_session)
                 send_message(token, sender, new_session.start_order())
                 continue
-
             faq = find_faq(admin_id, text)
-            if faq:
-                send_message(token, sender, faq)
-            else:
-                send_message(token, sender, generate_ai_reply(admin_id, sender, text))
-
+            if faq: send_message(token, sender, faq)
+            else: send_message(token, sender, generate_ai_reply(admin_id, sender, text))
     return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
