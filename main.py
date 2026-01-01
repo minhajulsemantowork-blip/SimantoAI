@@ -29,7 +29,9 @@ def get_session_from_db(session_id: str) -> Optional["OrderSession"]:
         res = supabase.table("order_sessions").select("*").eq("id", session_id).execute()
         if res.data:
             row = res.data[0]
-            session = OrderSession(row['admin_id'], row['customer_id'])
+            # সেশন ডাটায় admin_id এবং user_id এর সামঞ্জস্য রাখা হয়েছে
+            admin_id = row.get('user_id') or row.get('admin_id')
+            session = OrderSession(admin_id, row['customer_id'])
             session.step = row['step']
             session.data = row['data']
             return session
@@ -41,7 +43,7 @@ def save_session_to_db(session: "OrderSession"):
     try:
         supabase.table("order_sessions").upsert({
             "id": session.session_id,
-            "admin_id": session.admin_id,
+            "user_id": session.admin_id,
             "customer_id": session.customer_id,
             "step": session.step,
             "data": session.data,
@@ -127,8 +129,8 @@ def get_chat_memory(admin_id: str, customer_id: str, limit: int = 10) -> List[Di
             .eq("customer_id", customer_id) \
             .limit(1) \
             .execute()
-        if res.data:
-            return res.data[0].get("messages", [])[-limit:]
+        if res.data and isinstance(res.data[0].get("messages"), list):
+            return res.data[0].get("messages")[-limit:]
     except:
         pass
     return []
@@ -182,8 +184,8 @@ class OrderSession:
             if prod:
                 self.data["current_prod"] = prod
                 self.step = 4
-                return f"✅ {prod['name']}! কয় পিস নিতে চান? (স্টক: {prod['stock']})", False
-            return "পণ্যটি পাওয়া যায়নি। আবার নাম লিখুন:", False
+                return f"✅ {prod['name']}! কয় পিস নিতে চান? (স্টক: {prod['stock']})", False
+            return "পণ্যটি পাওয়া যায়নি। আবার নাম লিখুন:", False
 
         elif self.step == 4:
             if msg.isdigit() and int(msg) > 0:
@@ -193,22 +195,21 @@ class OrderSession:
                     self.data["items"].append({"id": prod['id'], "name": prod['name'], "qty": qty, "price": prod['price'] * qty})
                     self.data["product_price_total"] += prod['price'] * qty
                     self.step = 5
-                    return "যোগ হয়েছে! আরও পণ্য নিতে চাইলে নাম লিখুন, নয়তো 'done' লিখুন:", False
+                    return "যোগ হয়েছে! আরও পণ্য নিতে চাইলে নাম লিখুন, নয়তো 'done' লিখুন:", False
                 return f"দুঃখিত, স্টকে মাত্র {prod['stock']} পিস আছে।", False
             return "সঠিক সংখ্যা দিন:", False
 
         elif self.step == 5:
             if msg.lower() == 'done':
-                # Database থেকে delivery_info নিয়ে আসা হচ্ছে
                 business = get_business_settings(self.admin_id)
                 delivery_info = business.get('delivery_info', "ডেলিভারি চার্জের পরিমাণ লিখুন:") if business else "ডেলিভারি চার্জের পরিমাণ লিখুন:"
                 self.step = 6
-                return f"{delivery_info}\n\nআপনার জন্য প্রযোজ্য চার্জটি সংখ্যায় লিখুন:", False
+                return f"{delivery_info}\n\nআপনার জন্য প্রযোজ্য চার্জটি সংখ্যায় লিখুন:", False
             prod = self.find_product(msg)
             if prod:
                 self.data["current_prod"] = prod
                 self.step = 4
-                return f"✅ {prod['name']}! কয় পিস?", False
+                return f"✅ {prod['name']}! কয় পিস?", False
             return "পণ্যটির নাম অথবা 'done' লিখুন:", False
 
         elif self.step == 6:
@@ -217,7 +218,7 @@ class OrderSession:
                 self.data["total"] = self.data["product_price_total"] + self.data["delivery_charge"]
                 self.step = 7
                 return "আপনার পূর্ণাঙ্গ ডেলিভারি ঠিকানা দিন:", False
-            return "দয়া করে ডেলিভারি চার্জটি শুধুমাত্র সংখ্যায় লিখুন:", False
+            return "দয়া করে ডেলিভারি চার্জটি শুধুমাত্র সংখ্যায় লিখুন:", False
 
         elif self.step == 7:
             self.data["address"] = msg
@@ -228,9 +229,9 @@ class OrderSession:
         elif self.step == 8:
             if msg.lower() == 'confirm':
                 if self.save_order_db():
-                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। সিমন্ত (Simanto) শীঘ্রই আপনার সাথে যোগাযোগ করবে।", True
-                return "দুঃখিত, অর্ডার সেভ করার সময় কারিগরি সমস্যা হয়েছে।", True
-            return "অর্ডার বাতিল হয়েছে। পুনরায় অর্ডার দিতে 'অর্ডার' লিখুন।", True
+                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। সিমন্ত (Simanto) শীঘ্রই আপনার সাথে যোগাযোগ করবে।", True
+                return "দুঃখিত, অর্ডার সেভ করার সময় কারিগরি সমস্যা হয়েছে।", True
+            return "অর্ডার বাতিল হয়েছে। পুনরায় অর্ডার দিতে 'অর্ডার' লিখুন।", True
 
         return "দুঃখিত, আমি বুঝতে পারছি না।", True
 
@@ -292,36 +293,42 @@ def detect_intent_nlp(admin_id, text):
 def generate_ai_reply(admin_id, customer_id, user_msg):
     try:
         business = get_business_settings(admin_id)
-        business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী, একজন অভিজ্ঞ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
+        # শুদ্ধ প্রমিত বাংলার প্রম্পট
+        business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
         if business:
             business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
 
-        memory = get_chat_memory(admin_id, customer_id)
-        api_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
+        # মেমোরি লোড এবং ক্লিনজিং (ভ্যালিডেশন)
+        raw_memory = get_chat_memory(admin_id, customer_id)
+        valid_memory = [m for m in raw_memory if isinstance(m, dict) and 'role' in m and 'content' in m]
         
+        api_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
+        if not api_res.data:
+            return "হ্যালো আমি Simanto, আমাদের সিস্টেমে কিছু সমস্যা হয়েছে।"
+            
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_res.data[0]["groq_api_key"])
         
         products = get_products_with_details(admin_id)
-        product_text = "\n".join([f"- {p.get('name')} | ৳{p.get('price')}" for p in products if p.get("in_stock")])
+        product_text = "\n".join([f"- {p.get('name')} | ৳{p.get('price')}" for p in products if p.get("stock", 0) > 0])
 
         messages = [
             {
                 "role": "system", 
-                "content": f"{business_context}\nপণ্যের তালিকা:\n{product_text}\n\nগুরুত্বপূর্ণ: পণ্যের নামগুলি তালিকায় যেভাবে আছে, সেভাবেই ব্যবহার করবে।"
+                "content": f"{business_context}\nপণ্যের তালিকা:\n{product_text}\n\nগুরুত্বপূর্ণ: পণ্যের নামগুলি হুবহু ব্যবহার করবে।"
             }
         ]
-        messages.extend(memory)
+        messages.extend(valid_memory)
         messages.append({"role": "user", "content": user_msg})
 
         res = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, temperature=0.3)
         reply = res.choices[0].message.content.strip()
 
-        new_memory = memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+        new_memory = valid_memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         save_chat_memory(admin_id, customer_id, new_memory[-10:])
         return reply
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return "হ্যালো আমি Simanto, দুঃখিত একটু সমস্যা হচ্ছে। দয়া করে আবার মেসেজ দিন।"
+        return "হ্যালো আমি Simanto, দুঃখিত একটু সমস্যা হচ্ছে। দয়া করে আবার মেসেজ দিন।"
 
 # ================= WEBHOOK =================
 @app.route("/webhook", methods=["POST"])
