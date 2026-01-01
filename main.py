@@ -292,7 +292,7 @@ def detect_intent_nlp(admin_id, text):
 def generate_ai_reply(admin_id, customer_id, user_msg):
     try:
         business = get_business_settings(admin_id)
-        business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী,তুমি একজন অভিজ্ঞ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ, প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
+        business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী, একজন অভিজ্ঞ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
         if business:
             business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
 
