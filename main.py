@@ -238,9 +238,9 @@ def generate_ai_reply(admin_id, user_msg):
 """
 
     api_key = supabase.table("api_keys") \
-        .select("gemini_api_key") \
+        .select("groq_api_key") \
         .eq("user_id", admin_id) \
-        .execute().data[0]["gemini_api_key"]
+        .execute().data[0]["groq_api_key"]
 
     client = OpenAI(
         base_url="https://api.groq.com/openai/v1",
