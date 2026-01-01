@@ -83,11 +83,12 @@ def send_message(token, user_id, text):
 def get_products_with_details(admin_id: str):
     try:
         res = supabase.table("products") \
-            .select("*") \
+            .select("id, name, price, stock, category, description, in_stock") \
             .eq("user_id", admin_id) \
             .execute()
         return res.data or []
-    except:
+    except Exception as e:
+        logger.error(f"Product Fetch Error: {e}")
         return []
 
 # ================= FAQ (SEMANTIC SEARCH) =================
@@ -164,23 +165,15 @@ class OrderSession:
         msg = user_message.strip()
         self.products = get_products_with_details(self.admin_id)
 
-        # --- Context Handling (মাঝপথে প্রশ্ন করলে) ---
-        # যদি ইনপুটে প্রশ্নবোধক চিহ্ন থাকে বা কিছু নির্দিষ্ট কি-ওয়ার্ড থাকে
-        if any(word in msg for word in ["?", "কই", "কি", "কেন", "হবে", "আছে"]):
-            faq = find_faq(self.admin_id, msg)
-            next_step_prompt = self._get_next_step_reminder()
-            if faq:
-                return f"{faq}\n\nঅর্ডারটি সম্পন্ন করতে এখন আপনার {next_step_prompt} বলুন:", False
-            
-            # FAQ তে না থাকলে AI রিপ্লাই জেনারেট করা
-            ai_reply = generate_ai_reply(self.admin_id, self.customer_id, msg)
-            return f"{ai_reply}\n\nঅর্ডারটি সম্পন্ন করতে আপনার {next_step_prompt} বলুন:", False
-
+        # ১. নাম ইনপুট (স্টেপ ১ এ থাকা অবস্থায় সরাসরি নাম সেভ হবে, অন্য কিছু চেক করবে না)
         if self.step == 1:
+            if len(msg) < 2:
+                return "দয়া করে আপনার সঠিক নাম লিখুন:", False
             self.data["name"] = msg
             self.step = 2
             return "ধন্যবাদ! এখন আপনার ফোন নম্বর দিন:", False
 
+        # ২. ফোন নম্বর ইনপুট
         elif self.step == 2:
             phone_clean = re.sub(r'\D', '', msg)
             if len(phone_clean) == 11 and phone_clean.startswith('01'):
@@ -189,78 +182,98 @@ class OrderSession:
                 return f"কোন পণ্যটি অর্ডার করতে চান?\n\n{self.get_available_list()}", False
             return "সঠিক ফোন নম্বর দিন (যেমন: 017xxxxxxxx):", False
 
+        # ৩. পণ্য নির্বাচন
         elif self.step == 3:
+            # পণ্য নির্বাচনের সময় কাস্টমার প্রশ্ন করলে FAQ বা AI উত্তর দেবে
+            if any(word in msg for word in ["?", "কি", "কেন", "আছে"]):
+                faq = find_faq(self.admin_id, msg)
+                if faq: return f"{faq}\n\nঅর্ডার করতে পণ্যের নাম লিখুন:", False
+                ai_reply = generate_ai_reply(self.admin_id, self.customer_id, msg)
+                return f"{ai_reply}\n\nঅর্ডার করতে এখন পণ্যের নাম লিখুন:", False
+
             prod = self.find_product(msg)
             if prod:
                 self.data["current_prod"] = prod
                 self.step = 4
-                return f"✅ {prod['name']}! কয় পিস নিতে চান? (স্টক: {prod['stock']})", False
-            return "পণ্যটি পাওয়া যায়নি। আবার নাম লিখুন:", False
+                return f"✅ {prod['name']}! কয় পিস নিতে চান? (স্টক: {prod.get('stock', 'পর্যাপ্ত')})", False
+            return "দুঃখিত, এই নামে কোনো পণ্য পাওয়া যায়নি। লিস্ট থেকে নাম লিখুন:", False
 
+        # ৪. পরিমাণ নির্বাচন
         elif self.step == 4:
             if msg.isdigit() and int(msg) > 0:
                 qty = int(msg)
                 prod = self.data["current_prod"]
-                if prod['stock'] >= qty:
+                stock_available = prod.get('stock', 999)
+                if stock_available >= qty:
                     self.data["items"].append({"id": prod['id'], "name": prod['name'], "qty": qty, "price": prod['price'] * qty})
                     self.data["product_price_total"] += prod['price'] * qty
                     self.step = 5
-                    return "যোগ হয়েছে! আরও পণ্য নিতে চাইলে নাম লিখুন, নয়তো 'done' লিখুন:", False
-                return f"দুঃখিত, স্টকে মাত্র {prod['stock']} পিস আছে।", False
-            return "সঠিক সংখ্যা দিন:", False
+                    return "যোগ হয়েছে! আরও পণ্য নিতে চাইলে নাম লিখুন, নয়তো 'done' লিখুন:", False
+                return f"দুঃখিত, স্টকে মাত্র {stock_available} পিস আছে। কম সংখ্যা দিন:", False
+            return "দয়া করে সঠিক সংখ্যা লিখুন:", False
 
+        # ৫. আরও পণ্য বা সমাপ্তি
         elif self.step == 5:
             if msg.lower() == 'done':
                 business = get_business_settings(self.admin_id)
-                delivery_info = business.get('delivery_info', "ডেলিভারি চার্জের পরিমাণ লিখুন:") if business else "ডেলিভারি চার্জের পরিমাণ লিখুন:"
+                delivery_info = business.get('delivery_info', "ডেলিভারি চার্জের পরিমাণটি লিখুন:") if business else "ডেলিভারি চার্জ লিখুন:"
                 self.step = 6
-                return f"{delivery_info}\n\nআপনার জন্য প্রযোজ্য চার্জটি সংখ্যায় লিখুন:", False
+                return f"{delivery_info}\n\nচার্জটি সংখ্যায় লিখুন (যেমন: ৬০):", False
+            
             prod = self.find_product(msg)
             if prod:
                 self.data["current_prod"] = prod
                 self.step = 4
                 return f"✅ {prod['name']}! কয় পিস?", False
-            return "পণ্যটির নাম অথবা 'done' লিখুন:", False
+            return "পণ্যটির নাম লিখুন অথবা অর্ডার শেষ করতে 'done' লিখুন:", False
 
+        # ৬. ডেলিভারি চার্জ
         elif self.step == 6:
-            if msg.isdigit():
-                self.data["delivery_charge"] = int(msg)
+            charge = re.sub(r'\D', '', msg)
+            if charge.isdigit():
+                self.data["delivery_charge"] = int(charge)
                 self.data["total"] = self.data["product_price_total"] + self.data["delivery_charge"]
                 self.step = 7
                 return "আপনার পূর্ণাঙ্গ ডেলিভারি ঠিকানা দিন:", False
             return "দয়া করে ডেলিভারি চার্জটি শুধুমাত্র সংখ্যায় লিখুন:", False
 
+        # ৭. ঠিকানা
         elif self.step == 7:
+            if len(msg) < 5:
+                return "দয়া করে বিস্তারিত ঠিকানা লিখুন:", False
             self.data["address"] = msg
             self.step = 8
             summary = self.get_summary()
             return f"{summary}\n\nঅর্ডার কনফার্ম করতে 'confirm' লিখুন।", False
 
+        # ৮. কনফার্মেশন
         elif self.step == 8:
-            if msg.lower() == 'confirm':
+            if 'confirm' in msg.lower():
                 if self.save_order_db():
-                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। আমরা শীঘ্রই আপনার সাথে যোগাযোগ করবে।", True
+                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। আমরা শীঘ্রই আপনার সাথে যোগাযোগ করব।", True
                 return "দুঃখিত, অর্ডার সেভ করার সময় কারিগরি সমস্যা হয়েছে।", True
-            return "অর্ডার বাতিল হয়েছে। পুনরায় অর্ডার দিতে 'অর্ডার' লিখুন।", True
+            return "অর্ডার বাতিল করতে চাইলে মেসেজ দিন, অথবা কনফার্ম করতে 'confirm' লিখুন।", False
 
-        return "দুঃখিত, আমি বুঝতে পারছি না।", True
+        return "দুঃখিত, আমি বুঝতে পারছি না। পুনরায় চেষ্টা করুন।", False
 
     def _get_next_step_reminder(self):
-        prompts = {
-            1: "নাম", 2: "ফোন নম্বর", 3: "পণ্যের নাম", 4: "পিস বা পরিমাণ", 
-            5: "পণ্যের নাম অথবা 'done'", 6: "ডেলিভারি চার্জ", 7: "ঠিকানা", 8: "'confirm'"
-        }
+        prompts = {1: "নাম", 2: "ফোন নম্বর", 3: "পণ্যের নাম", 4: "পরিমাণ", 7: "ঠিকানা"}
         return prompts.get(self.step, "তথ্য")
 
     def find_product(self, query):
+        if not self.products: return None
         for p in self.products:
-            if query.lower() in p['name'].lower() and p.get('stock', 0) > 0:
+            if query.lower() in p['name'].lower() and p.get('in_stock', True):
                 return p
         return None
 
     def get_available_list(self):
-        items = [f"- {p['name']} (৳{p['price']})" for p in self.products if p.get('stock', 0) > 0]
-        return "\n".join(items) if items else "কোনো পণ্য স্টকে নেই।"
+        items = []
+        for p in self.products:
+            if p.get('in_stock', True) and p.get('stock', 0) > 0:
+                cat = f"[{p.get('category')}] " if p.get('category') else ""
+                items.append(f"- {cat}{p['name']} (৳{p['price']})")
+        return "\n".join(items) if items else "বর্তমানে কোনো পণ্য স্টকে নেই।"
 
     def get_summary(self):
         items_txt = "\n".join([f"• {i['name']} ({i['qty']} পিস)" for i in self.data['items']])
@@ -280,7 +293,6 @@ class OrderSession:
         try:
             all_product_names = ", ".join([item['name'] for item in self.data['items']])
             total_quantity = sum([item['qty'] for item in self.data['items']])
-
             res = supabase.table("orders").insert({
                 "user_id": self.admin_id, 
                 "customer_name": self.data["name"],
@@ -304,39 +316,46 @@ def detect_intent_nlp(admin_id, text):
         res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
         if not res.data: return False
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=res.data[0]["groq_api_key"])
-        prompt = f"Does the user want to order/buy something? Respond with 'YES' or 'NO' only. Input: {text}"
+        prompt = f"Does the user want to order or buy something? Respond ONLY with 'YES' or 'NO'. User said: {text}"
         comp = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
         return "YES" in comp.choices[0].message.content.upper()
     except:
-        return re.search(r"(কিনব|নিব|অর্ডার|order|confirm|নিতে চাই)", text.lower()) is not None
+        return re.search(r"(কিনব|নিব|অর্ডার|order|buy|নিতে চাই)", text.lower()) is not None
 
 def generate_ai_reply(admin_id, customer_id, user_msg):
     try:
         business = get_business_settings(admin_id)
-        business_context = f"তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী, তুমি সবসময় শুদ্ধ প্রমিত বাংলায় উত্তর দেবে, কখনো আন্দাজ করবে না, গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
+        business_context = "তুমি Simanto, একজন বন্ধুসুলভ বিক্রয় সহকারী। প্রমিত বাংলায় কথা বলো।\n"
         if business:
-            business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nযোগাযোগ নম্বর: {business.get('contact_number')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
+            business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nপেমেন্ট: {business.get('payment_methods')}\n"
+        
+        products = get_products_with_details(admin_id)
+        product_text = "পণ্য তালিকা:\n" + "\n".join([f"- {p['name']} | ৳{p['price']} | {p.get('description', '')}" for p in products])
         
         raw_memory = get_chat_memory(admin_id, customer_id)
-        valid_memory = [m for m in raw_memory if isinstance(m, dict) and 'role' in m and 'content' in m]
         api_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
-        if not api_res.data: return "হ্যালো আমি Simanto, আমাদের সিস্টেমে কিছু সমস্যা হয়েছে।"
+        if not api_res.data: return "হ্যালো, আমাদের সার্ভারে সমস্যা হচ্ছে।"
+        
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_res.data[0]["groq_api_key"])
-        products = get_products_with_details(admin_id)
-        product_text = "\n".join([f"- {p.get('name')} | ৳{p.get('price')}" for p in products if p.get("stock", 0) > 0])
-        messages = [{"role": "system", "content": f"{business_context}\nপণ্যের তালিকা:\n{product_text}\n\nগুরুত্বপূর্ণ: পণ্যের নামগুলি হুবহু ব্যবহার করবে।"}]
-        messages.extend(valid_memory)
+        messages = [{"role": "system", "content": f"{business_context}\n{product_text}"}]
+        messages.extend(raw_memory)
         messages.append({"role": "user", "content": user_msg})
+        
         res = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, temperature=0.3)
         reply = res.choices[0].message.content.strip()
-        new_memory = valid_memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
-        save_chat_memory(admin_id, customer_id, new_memory[-10:])
+        
+        save_chat_memory(admin_id, customer_id, (raw_memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
         return reply
-    except Exception as e:
-        logger.error(f"AI Error: {e}")
-        return "হ্যালো আমি Simanto, দুঃখিত একটু সমস্যা হচ্ছে। দয়া করে আবার মেসেজ দিন।"
+    except:
+        return "দুঃখিত, আমি এই মুহূর্তে উত্তর দিতে পারছি না।"
 
 # ================= WEBHOOK =================
+@app.route("/webhook", methods=["GET"])
+def verify():
+    if request.args.get("hub.mode") == "subscribe":
+        return request.args.get("hub.challenge")
+    return "OK", 200
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -349,22 +368,27 @@ def webhook():
             sender = msg_event["sender"]["id"]
             text = msg_event.get("message", {}).get("text")
             if not text: continue
+            
             session_id = f"order_{admin_id}_{sender}"
             current_session = get_session_from_db(session_id)
+            
             if current_session:
                 reply, done = current_session.process_response(text)
                 send_message(token, sender, reply)
                 if done: delete_session_from_db(session_id)
                 else: save_session_to_db(current_session)
                 continue
+                
             if detect_intent_nlp(admin_id, text):
                 new_session = OrderSession(admin_id, sender)
                 save_session_to_db(new_session)
                 send_message(token, sender, new_session.start_order())
                 continue
+                
             faq = find_faq(admin_id, text)
             if faq: send_message(token, sender, faq)
             else: send_message(token, sender, generate_ai_reply(admin_id, sender, text))
+            
     return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
