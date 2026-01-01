@@ -2,11 +2,12 @@ import os
 import re
 import logging
 import requests
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 from datetime import datetime
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from supabase import create_client, Client
+from difflib import SequenceMatcher
 
 # ================= CONFIG =================
 logging.basicConfig(level=logging.INFO)
@@ -14,286 +15,356 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ================= SUPABASE =================
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_KEY")
-)
+try:
+    supabase: Client = create_client(
+        os.getenv("SUPABASE_URL"),
+        os.getenv("SUPABASE_SERVICE_KEY")
+    )
+except Exception as e:
+    logger.error(f"Supabase Client Error: {e}")
 
-# ================= MEMORY =================
-_order_sessions: Dict[str, "OrderSession"] = {}
+# ================= SESSION DB HELPERS =================
+def get_session_from_db(session_id: str) -> Optional["OrderSession"]:
+    try:
+        res = supabase.table("order_sessions").select("*").eq("id", session_id).execute()
+        if res.data:
+            row = res.data[0]
+            session = OrderSession(row['admin_id'], row['customer_id'])
+            session.step = row['step']
+            session.data = row['data']
+            return session
+    except Exception as e:
+        logger.error(f"Session Retrieval Error: {e}")
+    return None
+
+def save_session_to_db(session: "OrderSession"):
+    try:
+        supabase.table("order_sessions").upsert({
+            "id": session.session_id,
+            "admin_id": session.admin_id,
+            "customer_id": session.customer_id,
+            "step": session.step,
+            "data": session.data,
+            "last_updated": datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        logger.error(f"Session Save Error: {e}")
+
+def delete_session_from_db(session_id: str):
+    try:
+        supabase.table("order_sessions").delete().eq("id", session_id).execute()
+    except Exception as e:
+        logger.error(f"Session Delete Error: {e}")
 
 # ================= HELPERS =================
 def get_page_client(page_id):
-    res = supabase.table("facebook_integrations") \
-        .select("*") \
-        .eq("page_id", str(page_id)) \
-        .eq("is_connected", True) \
-        .execute()
-    return res.data[0] if res.data else None
+    try:
+        res = supabase.table("facebook_integrations") \
+            .select("*") \
+            .eq("page_id", str(page_id)) \
+            .eq("is_connected", True) \
+            .execute()
+        return res.data[0] if res.data else None
+    except:
+        return None
 
 def send_message(token, user_id, text):
-    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
-    requests.post(url, json={
-        "recipient": {"id": user_id},
-        "message": {"text": text}
-    })
+    try:
+        url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
+        res = requests.post(url, json={
+            "recipient": {"id": user_id},
+            "message": {"text": text}
+        })
+        res.raise_for_status()
+    except Exception as e:
+        logger.error(f"Facebook API Error: {e}")
 
 def get_products_with_details(admin_id: str):
-    res = supabase.table("products") \
-        .select("*") \
-        .eq("user_id", admin_id) \
-        .execute()
-    return res.data or []
+    try:
+        res = supabase.table("products") \
+            .select("*") \
+            .eq("user_id", admin_id) \
+            .execute()
+        return res.data or []
+    except:
+        return []
 
-# ================= ORDER SESSION (UNCHANGED) =================
+# ================= FAQ (SEMANTIC SEARCH) =================
+def find_faq(admin_id: str, user_msg: str) -> Optional[str]:
+    try:
+        res = supabase.table("faqs").select("question, answer").eq("user_id", admin_id).execute()
+        faqs = res.data or []
+        best_ratio = 0
+        best_answer = None
+        
+        for faq in faqs:
+            ratio = SequenceMatcher(None, user_msg.lower(), faq["question"].lower()).ratio()
+            if ratio > best_ratio and ratio > 0.65:
+                best_ratio = ratio
+                best_answer = faq["answer"]
+        return best_answer
+    except:
+        return None
+
+# ================= BUSINESS SETTINGS =================
+def get_business_settings(admin_id: str) -> Optional[Dict]:
+    try:
+        res = supabase.table("business_settings") \
+            .select("*") \
+            .eq("user_id", admin_id) \
+            .limit(1) \
+            .execute()
+        return res.data[0] if res.data else None
+    except:
+        return None
+
+# ================= CHAT MEMORY =================
+def get_chat_memory(admin_id: str, customer_id: str, limit: int = 10) -> List[Dict]:
+    try:
+        res = supabase.table("chat_history") \
+            .select("messages") \
+            .eq("user_id", admin_id) \
+            .eq("customer_id", customer_id) \
+            .limit(1) \
+            .execute()
+        if res.data:
+            return res.data[0].get("messages", [])[-limit:]
+    except:
+        pass
+    return []
+
+def save_chat_memory(admin_id: str, customer_id: str, messages: List[Dict]):
+    try:
+        now = datetime.utcnow().isoformat()
+        existing = supabase.table("chat_history").select("id").eq("user_id", admin_id).eq("customer_id", customer_id).execute()
+        if existing.data:
+            supabase.table("chat_history").update({"messages": messages, "last_updated": now}).eq("id", existing.data[0]["id"]).execute()
+        else:
+            supabase.table("chat_history").insert({"user_id": admin_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
+    except Exception as e:
+        logger.error(f"Chat Memory Error: {e}")
+
+# ================= ORDER SESSION =================
 class OrderSession:
-    """Manage order collection session for a customer"""
-
     def __init__(self, admin_id: str, customer_id: str):
         self.admin_id = admin_id
         self.customer_id = customer_id
         self.session_id = f"order_{admin_id}_{customer_id}"
         self.step = 0
         self.data = {
-            "name": "",
-            "phone": "",
-            "product": "",
-            "quantity": "",
-            "address": "",
-            "status": "pending",
-            "total": 0
+            "name": "", "phone": "", "items": [], "address": "", 
+            "product_price_total": 0, "delivery_charge": 0, "total": 0, "current_prod": None
         }
-        self.products = get_products_with_details(admin_id)
 
     def start_order(self):
         self.step = 1
-        _order_sessions[self.session_id] = self
-        return "অর্ডার নেওয়া শুরু করছি! প্রথমে আপনার নাম বলুন:"
+        return "জি, আমি সিমন্ত (Simanto)। অর্ডার নিতে সাহায্য করছি। প্রথমে আপনার নাম বলুন:"
 
     def process_response(self, user_message: str) -> Tuple[str, bool]:
-        completed = False
+        msg = user_message.strip()
+        self.products = get_products_with_details(self.admin_id)
 
         if self.step == 1:
-            self.data["name"] = user_message.strip()
+            self.data["name"] = msg
             self.step = 2
             return "ধন্যবাদ! এখন আপনার ফোন নম্বর দিন:", False
 
         elif self.step == 2:
-            phone = user_message.strip()
-            if self.validate_phone(phone):
-                self.data["phone"] = phone
+            phone_clean = re.sub(r'\D', '', msg)
+            if len(phone_clean) == 11 and phone_clean.startswith('01'):
+                self.data["phone"] = phone_clean
                 self.step = 3
-                products_text = self.get_available_products()
-                return f"ফোন নম্বর সংরক্ষিত! কোন পণ্য অর্ডার করতে চান?\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
-            else:
-                return "দুঃখিত, সঠিক ফোন নম্বর দিন:", False
+                return f"কোন পণ্যটি অর্ডার করতে চান?\n\n{self.get_available_list()}", False
+            return "সঠিক ফোন নম্বর দিন (যেমন: 017xxxxxxxx):", False
 
         elif self.step == 3:
-            selected_product = self.find_product(user_message)
-            if selected_product:
-                self.data["product"] = selected_product["name"]
-                self.data["product_id"] = selected_product.get("id")
+            prod = self.find_product(msg)
+            if prod:
+                self.data["current_prod"] = prod
                 self.step = 4
-                stock = selected_product.get("stock", 0)
-                price = selected_product.get("price", 0)
-                description = selected_product.get("description", "")
-                features = selected_product.get("features", "")
-                return (
-                    f"✅ **{selected_product['name']}** নির্বাচিত!\n\n"
-                    f"💰 দাম: ৳{price:,}\n"
-                    f"📝 বিবরণ: {description}\n"
-                    f"🌟 বৈশিষ্ট্য: {features}\n\n"
-                    f"কত পিস চান? (স্টকে আছে: {stock} পিস):"
-                ), False
-            else:
-                products_text = self.get_available_products()
-                return f"পণ্যটি খুঁজে পাইনি। আবার চেষ্টা করুন:\n\n{products_text}\n\nপণ্যের নাম লিখুন:", False
+                return f"✅ {prod['name']}! কয় পিস নিতে চান? (স্টক: {prod['stock']})", False
+            return "পণ্যটি পাওয়া যায়নি। আবার নাম লিখুন:", False
 
         elif self.step == 4:
-            if user_message.isdigit():
-                quantity = int(user_message)
-                if quantity > 0:
-                    product = self.find_product_by_name(self.data["product"])
-                    if product:
-                        stock = product.get("stock", 0)
-                        if stock >= quantity:
-                            self.data["quantity"] = quantity
-                            price = product.get("price", 0)
-                            self.data["total"] = price * quantity
-                            self.step = 5
-                            return (
-                                f"✅ {quantity} পিস নির্বাচিত!\n"
-                                f"💰 মোট মূল্য: ৳{self.data['total']:,}\n\n"
-                                f"এখন আপনার ডেলিভারি ঠিকানা দিন (বিস্তারিত):"
-                            ), False
-                        else:
-                            return f"দুঃখিত, স্টকে মাত্র {stock} পিস আছে। কম সংখ্যক দিন:", False
-                return "দুঃখিত, ১ বা তার বেশি সংখ্যা দিন:", False
-            return "দুঃখিত, সংখ্যা দিন (যেমন: 1, 2, 3):", False
+            if msg.isdigit() and int(msg) > 0:
+                qty = int(msg)
+                prod = self.data["current_prod"]
+                if prod['stock'] >= qty:
+                    self.data["items"].append({"id": prod['id'], "name": prod['name'], "qty": qty, "price": prod['price'] * qty})
+                    self.data["product_price_total"] += prod['price'] * qty
+                    self.step = 5
+                    return "যোগ হয়েছে! আরও পণ্য নিতে চাইলে নাম লিখুন, নয়তো 'done' লিখুন:", False
+                return f"দুঃখিত, স্টকে মাত্র {prod['stock']} পিস আছে।", False
+            return "সঠিক সংখ্যা দিন:", False
 
         elif self.step == 5:
-            self.data["address"] = user_message.strip()
-            self.step = 6
-            summary = self.get_order_summary()
-            return (
-                f"ঠিকানা সংরক্ষিত!\n\n{summary}\n\n"
-                f"অর্ডার কনফার্ম করতে শুধুমাত্র 'confirm' লিখুন।\n"
-                f"অন্য কিছু লিখলে অর্ডার বাতিল হবে।"
-            ), False
+            if msg.lower() == 'done':
+                # Database থেকে delivery_info নিয়ে আসা হচ্ছে
+                business = get_business_settings(self.admin_id)
+                delivery_info = business.get('delivery_info', "ডেলিভারি চার্জের পরিমাণ লিখুন:") if business else "ডেলিভারি চার্জের পরিমাণ লিখুন:"
+                self.step = 6
+                return f"{delivery_info}\n\nআপনার জন্য প্রযোজ্য চার্জটি সংখ্যায় লিখুন:", False
+            prod = self.find_product(msg)
+            if prod:
+                self.data["current_prod"] = prod
+                self.step = 4
+                return f"✅ {prod['name']}! কয় পিস?", False
+            return "পণ্যটির নাম অথবা 'done' লিখুন:", False
 
         elif self.step == 6:
-            if user_message.lower().strip() == "confirm":
-                if self.save_order():
-                    completed = True
-                    return (
-                        f"✅ অর্ডার সফলভাবে কনফার্ম হয়েছে!\n\n"
-                        f"অর্ডার আইডি: {self.data.get('order_id')}\n\n"
-                        f"আমরা শীঘ্রই আপনার সাথে যোগাযোগ করব। ধন্যবাদ! 😊"
-                    ), True
-                return "❌ অর্ডার সেভ করতে সমস্যা হয়েছে।", True
-            completed = True
-            return "অর্ডার বাতিল হয়েছে। আবার অর্ডার দিতে 'অর্ডার' লিখুন।", True
+            if msg.isdigit():
+                self.data["delivery_charge"] = int(msg)
+                self.data["total"] = self.data["product_price_total"] + self.data["delivery_charge"]
+                self.step = 7
+                return "আপনার পূর্ণাঙ্গ ডেলিভারি ঠিকানা দিন:", False
+            return "দয়া করে ডেলিভারি চার্জটি শুধুমাত্র সংখ্যায় লিখুন:", False
 
-        return "কিছু সমস্যা হয়েছে। আবার চেষ্টা করুন।", True
+        elif self.step == 7:
+            self.data["address"] = msg
+            self.step = 8
+            summary = self.get_summary()
+            return f"{summary}\n\nঅর্ডার কনফার্ম করতে 'confirm' লিখুন।", False
 
-    def validate_phone(self, phone: str) -> bool:
-        phone_clean = re.sub(r'\D', '', phone)
-        return len(phone_clean) == 11 and phone_clean.startswith('01')
+        elif self.step == 8:
+            if msg.lower() == 'confirm':
+                if self.save_order_db():
+                    return f"✅ অর্ডার সফল হয়েছে! সর্বমোট ৳{self.data['total']:,} (ডেলিভারি চার্জসহ)। সিমন্ত (Simanto) শীঘ্রই আপনার সাথে যোগাযোগ করবে।", True
+                return "দুঃখিত, অর্ডার সেভ করার সময় কারিগরি সমস্যা হয়েছে।", True
+            return "অর্ডার বাতিল হয়েছে। পুনরায় অর্ডার দিতে 'অর্ডার' লিখুন।", True
 
-    def get_available_products(self) -> str:
-        available = []
+        return "দুঃখিত, আমি বুঝতে পারছি না।", True
+
+    def find_product(self, query):
         for p in self.products:
-            if p.get("in_stock") and p.get("stock", 0) > 0:
-                available.append(
-                    f"- {p.get('name')} (৳{p.get('price'):,}, স্টক: {p.get('stock')})"
-                )
-        return "স্টকে থাকা পণ্য:\n\n" + "\n".join(available) if available else "এখন কোনো পণ্য স্টকে নেই।"
-
-    def find_product(self, query: str) -> Optional[Dict]:
-        q = query.lower().strip()
-        for p in self.products:
-            name = p.get("name", "").lower()
-            if q in name or name in q:
-                if p.get("in_stock") and p.get("stock", 0) > 0:
-                    return p
-        return None
-
-    def find_product_by_name(self, name: str) -> Optional[Dict]:
-        for p in self.products:
-            if p.get("name", "").lower().strip() == name.lower().strip():
+            if query.lower() in p['name'].lower() and p.get('stock', 0) > 0:
                 return p
         return None
 
-    def get_order_summary(self) -> str:
+    def get_available_list(self):
+        items = [f"- {p['name']} (৳{p['price']})" for p in self.products if p.get('stock', 0) > 0]
+        return "\n".join(items) if items else "কোনো পণ্য স্টকে নেই।"
+
+    def get_summary(self):
+        items_txt = "\n".join([f"• {i['name']} ({i['qty']} পিস)" for i in self.data['items']])
         return (
-            f"📦 অর্ডার সামারি:\n"
-            f"👤 নাম: {self.data['name']}\n"
-            f"📱 ফোন: {self.data['phone']}\n"
-            f"🛒 পণ্য: {self.data['product']}\n"
-            f"🔢 পরিমাণ: {self.data['quantity']} পিস\n"
-            f"💰 মোট: ৳{self.data['total']:,}\n"
-            f"🏠 ঠিকানা: {self.data['address']}"
+            f"📋 অর্ডার সামারি:\n"
+            f"নাম: {self.data['name']}\n"
+            f"ফোন: {self.data['phone']}\n"
+            f"পণ্যসমূহ:\n{items_txt}\n"
+            f"-------------------\n"
+            f"পণ্যের মূল্য: ৳{self.data['product_price_total']:,}\n"
+            f"ডেলিভারি চার্জ: ৳{self.data['delivery_charge']:,}\n"
+            f"সর্বমোট: ৳{self.data['total']:,}\n"
+            f"ঠিকানা: {self.data['address']}"
         )
 
-    def save_order(self) -> bool:
+    def save_order_db(self) -> bool:
         try:
             res = supabase.table("orders").insert({
-                "user_id": self.admin_id,
+                "user_id": self.admin_id, 
                 "customer_name": self.data["name"],
-                "customer_phone": self.data["phone"],
-                "product": self.data["product"],
-                "quantity": int(self.data["quantity"]),
+                "customer_phone": self.data["phone"], 
                 "address": self.data["address"],
-                "total": float(self.data["total"]),
-                "status": "pending",
+                "delivery_charge": self.data["delivery_charge"],
+                "total": self.data["total"], 
+                "items": self.data["items"],
+                "status": "pending", 
                 "created_at": datetime.utcnow().isoformat()
             }).execute()
-            if res.data:
-                self.data["order_id"] = res.data[0].get("id")
-                return True
-            return False
+            return True if res.data else False
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Save Order Error: {e}")
             return False
 
-# ================= AI =================
-def generate_ai_reply(admin_id, user_msg):
-    products = get_products_with_details(admin_id)
-    product_text = "\n".join(
-        f"- {p.get('name')} | ৳{p.get('price')} | {p.get('description')}"
-        for p in products if p.get("in_stock")
-    )
+# ================= AI & INTENT DETECTION =================
+def detect_intent_nlp(admin_id, text):
+    try:
+        res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
+        if not res.data: return False
+        
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=res.data[0]["groq_api_key"])
+        prompt = f"Does the user want to order/buy something? Respond with 'YES' or 'NO' only. Input: {text}"
+        comp = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
+        return "YES" in comp.choices[0].message.content.upper()
+    except:
+        return re.search(r"(কিনব|নিব|অর্ডার|order|confirm|নিতে চাই)", text.lower()) is not None
 
-    system_prompt = f"""
-তুমি একজন অভিজ্ঞ বিক্রয় সহকারী।
+def generate_ai_reply(admin_id, customer_id, user_msg):
+    try:
+        business = get_business_settings(admin_id)
+        business_context = f"তুমি Simanto, তুমি একজন অভিজ্ঞ বিক্রয় সহকারী।
 তুমি সবসময় শুদ্ধ, প্রমিত বাংলায় উত্তর দেবে।
 কখনো আন্দাজ করবে না।
-গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।
+গ্রাহক কিনতে চাইলে অর্ডারে পাঠাবে।\n"
+        if business:
+            business_context += f"ব্যবসা: {business.get('name')}\nঠিকানা: {business.get('address')}\nপেমেন্ট: {business.get('payment_methods')}\nডেলিভারি তথ্য: {business.get('delivery_info')}\n"
 
-পণ্যের তালিকা:
-{product_text}
+        memory = get_chat_memory(admin_id, customer_id)
+        api_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
+        
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_res.data[0]["groq_api_key"])
+        
+        products = get_products_with_details(admin_id)
+        product_text = "\n".join([f"- {p.get('name')} | ৳{p.get('price')}" for p in products if p.get("in_stock")])
 
-গ্রাহকের প্রশ্ন:
-"{user_msg}"
-"""
+        messages = [
+            {
+                "role": "system", 
+                "content": f"{business_context}\nপণ্যের তালিকা:\n{product_text}\n\nগুরুত্বপূর্ণ: পণ্যের নামগুলি তালিকায় যেভাবে আছে, সেভাবেই ব্যবহার করবে।"
+            }
+        ]
+        messages.extend(memory)
+        messages.append({"role": "user", "content": user_msg})
 
-    api_key = supabase.table("api_keys") \
-        .select("groq_api_key") \
-        .eq("user_id", admin_id) \
-        .execute().data[0]["groq_api_key"]
+        res = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, temperature=0.3)
+        reply = res.choices[0].message.content.strip()
 
-    client = OpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        api_key=api_key
-    )
-
-    res = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "system", "content": system_prompt}],
-        temperature=0.6,
-        max_tokens=650
-    )
-    return res.choices[0].message.content.strip()
+        new_memory = memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+        save_chat_memory(admin_id, customer_id, new_memory[-10:])
+        return reply
+    except Exception as e:
+        logger.error(f"AI Error: {e}")
+        return "হাই আমি Simanto, দুঃখিত একটু সমস্যা হচ্ছে। দয়া করে আবার মেসেজ দিন।"
 
 # ================= WEBHOOK =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-
     for entry in data.get("entry", []):
         page_id = entry.get("id")
         page = get_page_client(page_id)
-        if not page:
-            continue
-
-        admin_id = page["user_id"]
-        token = page["page_access_token"]
+        if not page: continue
+        
+        token, admin_id = page["page_access_token"], page["user_id"]
 
         for msg_event in entry.get("messaging", []):
             sender = msg_event["sender"]["id"]
             text = msg_event.get("message", {}).get("text")
-            if not text:
-                continue
+            if not text: continue
 
             session_id = f"order_{admin_id}_{sender}"
+            current_session = get_session_from_db(session_id)
 
-            if session_id in _order_sessions:
-                reply, done = _order_sessions[session_id].process_response(text)
+            if current_session:
+                reply, done = current_session.process_response(text)
                 send_message(token, sender, reply)
-                if done:
-                    del _order_sessions[session_id]
+                if done: delete_session_from_db(session_id)
+                else: save_session_to_db(current_session)
                 continue
 
-            if re.search(r"(কিনব|নিব|অর্ডার|order|confirm|নিতে চাই)", text.lower()):
-                session = OrderSession(admin_id, sender)
-                send_message(token, sender, session.start_order())
+            if detect_intent_nlp(admin_id, text):
+                new_session = OrderSession(admin_id, sender)
+                save_session_to_db(new_session)
+                send_message(token, sender, new_session.start_order())
                 continue
 
-            reply = generate_ai_reply(admin_id, text)
-            send_message(token, sender, reply)
+            faq = find_faq(admin_id, text)
+            if faq:
+                send_message(token, sender, faq)
+            else:
+                send_message(token, sender, generate_ai_reply(admin_id, sender, text))
 
     return jsonify({"ok": True}), 200
 
-# ================= RUN =================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
