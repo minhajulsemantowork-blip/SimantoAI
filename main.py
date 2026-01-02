@@ -139,7 +139,7 @@ def get_page_client_cached(page_id: str) -> Optional[Dict]:
             .select("*") \
             .eq("page_id", str(page_id)) \
             .eq("is_connected", True) \
-            .eq("is_active", True) \
+            .eq("is_connected", True) \
             .single().execute()
         
         if res.data:
@@ -207,11 +207,9 @@ def get_products_with_details_cached(admin_id: str) -> List[Dict]:
     
     try:
         res = supabase.table("products") \
-            .select("id, name, price, stock, category, description, in_stock, image_url, tags, is_featured, discount_price, unit") \
+            .select("id, name, price, stock, category, description, in_stock, image_url, unit") \
             .eq("user_id", admin_id) \
             .eq("in_stock", True) \
-            .eq("is_active", True) \
-            .order("is_featured", desc=True) \
             .order("category") \
             .execute()
         
@@ -273,10 +271,8 @@ def find_faq_cached(admin_id: str, user_msg: str) -> Optional[str]:
     
     try:
         res = supabase.table("faqs") \
-            .select("question, answer, priority") \
+            .select("question, answer") \
             .eq("user_id", admin_id) \
-            .eq("is_active", True) \
-            .order("priority", desc=True) \
             .execute()
 
         faqs = res.data or []
@@ -324,10 +320,8 @@ def get_sales_promotions_cached(admin_id: str) -> List[Dict]:
         res = supabase.table("promotions") \
             .select("*") \
             .eq("user_id", admin_id) \
-            .eq("is_active", True) \
             .lte("start_date", now) \
             .gte("end_date", now) \
-            .order("priority", desc=True) \
             .execute()
         
         return res.data or []
