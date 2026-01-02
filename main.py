@@ -71,7 +71,6 @@ def send_message(token, user_id, text):
         logger.error(f"Failed to send message: {e}")
 
 def send_image(token, user_id, image_url):
-    """ফেসবুকে প্রোডাক্টের ছবি পাঠানোর ফাংশন"""
     if not image_url: return
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
     payload = {
@@ -90,7 +89,6 @@ def send_image(token, user_id, image_url):
 
 # ================= DATA FETCHERS =================
 def get_products_with_details(admin_id: str):
-    # products টেবিল থেকে image_url সহ সব তথ্য আনা হচ্ছে
     res = supabase.table("products").select("*").eq("user_id", admin_id).execute()
     return res.data or []
 
@@ -115,70 +113,61 @@ def save_chat_memory(admin_id: str, customer_id: str, messages: List[Dict]):
     else:
         supabase.table("chat_history").insert({"user_id": admin_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
-# ================= AI LOGIC (PROMITO BANGLA & RETRY) =================
+# ================= AI LOGIC (REVISED FLOW) =================
 def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, max_retries=3):
-    """
-    Groq Free API Rate Limit হ্যান্ডেল করার জন্য রি-ট্রাই লজিক।
-    """
     business = get_business_settings(admin_id)
     products = get_products_with_details(admin_id)
     faqs = get_faqs(admin_id)
     
-    # ফোন নম্বর সেটআপ
-    biz_phone = business.get('phone_number', '') if business else ""
-    contact_instruction = f"প্রয়োজনে আমাদের হটলাইন নম্বরে কল করুন: {biz_phone}।" if biz_phone else "প্রয়োজনে সরাসরি আমাদের পেইজে কল করুন।"
-
-    # প্রোডাক্ট এবং FAQ টেক্সট তৈরি
-    product_text = "\n".join([
-        f"- পণ্যের নাম (Exact Name): {p.get('name')}\n  ক্যাটাগরি: {p.get('category')}\n  মূল্য: ৳{p.get('price')}\n  বিবরণ: {p.get('description')}" 
-        for p in products if p.get("in_stock")
-    ])
+    # Contact Number Logic (Updated Column Name)
+    biz_phone = business.get('contact_number', '') if business else ""
     
-    faq_text = "\n".join([f"প্রশ্ন: {f['question']} | উত্তর: {f['answer']}" for f in faqs])
-    
-    delivery_charge = business.get('delivery_charge', 60) if business else 60
+    # Product List & FAQ
+    product_text = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}\n  বিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
+    faq_text = "\n".join([f"Q: {f['question']} | A: {f['answer']}" for f in faqs])
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
+    delivery_charge = business.get('delivery_charge', 60) if business else 60
 
-    # === সিস্টেম প্রম্পট (প্রমিত বাংলা) ===
+    # === SYSTEM PROMPT ===
     system_prompt = (
-        f"আপনি '{business_name}'-এর একজন অত্যন্ত দক্ষ, বিনয়ী এবং পেশাদার বিক্রয় প্রতিনিধি।\n"
-        "আপনার প্রধান লক্ষ্য গ্রাহককে সন্তুষ্ট করা এবং পণ্য কিনতে সহায়তা করা।\n\n"
-        "কঠোর নির্দেশাবলী:\n"
-        "১. সর্বদা প্রমিত বাংলায় (Standard Bangla) কথা বলুন। আঞ্চলিকতা পরিহার করুন। গ্রাহককে সর্বদা 'আপনি' বলে সম্বোধন করবেন।\n"
-        f"২. যদি গ্রাহক সরাসরি কথা বলতে চায় বা জরুরি প্রয়োজন হয়, তবে এই নির্দেশ দিন: '{contact_instruction}'\n"
-        "৩. পণ্যের নাম ডাটাবেসে যেভাবে ইংরেজিতে বা বাংলায় আছে, হুবহু সেভাবেই বলবেন (কোনো অনুবাদ করবেন না)।\n"
-        "৪. শুধুমাত্র নিচে দেওয়া 'পণ্যের বিবরণ' এবং 'FAQ' থেকে তথ্য নিয়ে উত্তর দিন। এর বাইরে নিজের থেকে কোনো তথ্য বানাবেন না।\n"
-        "৫. গ্রাহক কোনো নির্দিষ্ট পণ্যের বিস্তারিত জানতে চাইলে, সেই পণ্যটির সঠিক নাম উল্লেখ করে বিস্তারিত সুন্দর করে গুছিয়ে বলুন।\n"
-        "৬. অর্ডার কনফার্ম করার জন্য গ্রাহকের নাম, ফোন নম্বর এবং সম্পূর্ণ ঠিকানা বিনয়ের সাথে জানতে চান।\n"
-        f"\n[পণ্যের তালিকা ও বিবরণ]:\n{product_text}\n\n[সচরাচর জিজ্ঞাসিত প্রশ্ন (FAQ)]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
+        f"আপনি '{business_name}'-এর একজন বন্ধুসুলভ এবং পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
+        "আপনার কাজ হলো গ্রাহকের প্রশ্নের উত্তর দেওয়া এবং পণ্য বিক্রয়ে সহায়তা করা।\n\n"
+        "**আচরণবিধি (কঠোরভাবে পালন করবেন):**\n"
+        "১. সর্বদা মার্জিত এবং প্রমিত বাংলা ব্যবহার করুন।\n"
+        "২. শুরুতে কখনোই গ্রাহকের নাম, ফোন বা ঠিকানা চাইবেন না।\n"
+        "৩. যদি গ্রাহক কোনো পণ্য সম্পর্কে জানতে চায়, তবে ডাটাবেস থেকে তথ্য দিন।\n"
+        "৪. শুধুমাত্র যখন গ্রাহক পণ্যটি **কিনতে চাইবে** বা **অর্ডার করতে চাইবে**, তখন জিজ্ঞেস করুন: 'আপনি কি এটি অর্ডার করতে চান?'\n"
+        "৫. গ্রাহক যদি অর্ডার করতে সম্মতি দেয় (যেমন: হ্যাঁ/Hae/Order korbo), তখনই শুধুমাত্র নাম, ফোন নম্বর এবং ঠিকানা চাইবেন।\n"
+        f"৬. যদি গ্রাহকের প্রশ্নের উত্তর [পণ্যের তালিকা] বা [FAQ]-তে না থাকে, তবে বিনীতভাবে বলুন যে এই তথ্যটি আপনার জানা নেই এবং প্রয়োজনে এই নম্বরে কল করতে বলুন: {biz_phone}। (এই নম্বরটি অন্য কোনো ক্ষেত্রে অযথা দেবেন না)।\n"
+        "৭. অর্ডার কনফার্ম করার জন্য সব তথ্য (নাম, ফোন, ঠিকানা) পাওয়ার পর একটি সুন্দর অর্ডার সামারি দিন এবং শেষে বলুন: 'অর্ডারটি কনফার্ম করতে Confirm লিখুন।'\n"
+        f"\n[পণ্যের তালিকা]:\n{product_text}\n\n[FAQ]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
     )
 
     memory = get_chat_memory(admin_id, customer_id)
     api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
     
     if not api_key_res.data:
-        return "দুঃখিত, সিস্টেমের একটি ত্রুটির কারণে আমি এখন উত্তর দিতে পারছি না।", None
+        return "সিস্টেমের ত্রুটির কারণে উত্তর দেওয়া সম্ভব হচ্ছে না।", None
 
     client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key_res.data[0]["groq_api_key"])
 
-    # === RETRY LOOP ===
+    # === RETRY LOGIC ===
     for i in range(max_retries):
         try:
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}] + memory + [{"role": "user", "content": user_msg}],
-                temperature=0.7 
+                temperature=0.6 
             )
             
             reply = res.choices[0].message.content.strip()
             
-            # মেমোরি সেভ করা
+            # Memory Save
             save_chat_memory(admin_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
             
-            # প্রোডাক্টের ইমেজ খোঁজা (Semantic check)
+            # Image Check
             matched_image = None
             for p in products:
-                # যদি বটের রিপ্লাইতে প্রোডাক্টের নাম থাকে এবং সেই প্রোডাক্টের ইমেজ থাকে
                 if p.get('name') and p.get('name').lower() in reply.lower() and p.get('image_url'):
                     matched_image = p.get('image_url')
                     break
@@ -187,19 +176,17 @@ def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, max_retries=3)
 
         except Exception as e:
             logger.warning(f"AI Attempt {i+1} failed: {e}")
-            if "429" in str(e): # Rate Limit Error
+            if "429" in str(e): # Rate Limit
                 if i < max_retries - 1:
-                    # এখানে ৬০ সেকেন্ড অপেক্ষা করা হচ্ছে (Groq এর লিমিট ১ মিনিটে রিসেট হয়)
-                    # ২ মিনিট অপেক্ষা করলে Facebook Webhook Timeout হয়ে যাবে, তাই ৬০ সেকেন্ড নিরাপদ।
-                    time.sleep(60) 
+                    time.sleep(30) # Wait 30s
                     continue
             
             if i == max_retries - 1:
-                return "দুঃখিত, এই মুহূর্তে আমাদের সার্ভার ব্যস্ত আছে। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।", None
+                return "দুঃখিত, সার্ভার ব্যস্ত থাকায় উত্তর দিতে পারছি না। একটু পরে চেষ্টা করুন।", None
 
-    return "দুঃখিত, একটি সমস্যা হয়েছে।", None
+    return "দুঃখিত, সমস্যা হয়েছে।", None
 
-# ================= ORDER EXTRACTION (RETRY ADDED) =================
+# ================= ORDER EXTRACTION =================
 def extract_order_data_with_retry(admin_id, messages, max_retries=2):
     api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
     if not api_key_res.data: return None
@@ -208,14 +195,14 @@ def extract_order_data_with_retry(admin_id, messages, max_retries=2):
 
     prompt = (
         "Extract order details into JSON. Keys: name, phone, address, items (product_name, quantity). "
-        "Product name MUST match exactly from context."
+        "Return ONLY JSON."
     )
 
     for i in range(max_retries):
         try:
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": prompt}] + messages[-8:],
+                messages=[{"role": "system", "content": prompt}] + messages[-6:], # Last 6 messages enough for context
                 response_format={"type": "json_object"},
                 temperature=0
             )
@@ -247,7 +234,9 @@ class OrderSession:
                 "created_at": datetime.utcnow().isoformat()
             }).execute()
             return True if res.data else False
-        except Exception: return False
+        except Exception as e:
+            logger.error(f"DB Save Error: {e}")
+            return False
 
 # ================= WEBHOOK =================
 @app.route("/webhook", methods=["POST"])
@@ -272,63 +261,67 @@ def webhook():
             session_id = f"order_{admin_id}_{sender}"
             current_session = get_session_from_db(session_id)
 
-            # --- COMMAND HANDLING ---
-            if text == "confirm":
-                if current_session and current_session.save_order():
-                    send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ।")
-                    delete_session_from_db(session_id)
+            # --- CONFIRM / CANCEL COMMANDS ---
+            if "confirm" in text or "কনফার্ম" in text:
+                if current_session and current_session.data.get("name"): # Check if data exists
+                    if current_session.save_order():
+                        send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ আমাদের সাথে থাকার জন্য।")
+                        delete_session_from_db(session_id)
+                    else:
+                        send_message(token, sender, "❌ অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।")
                 else:
-                    send_message(token, sender, "❌ কোনো একটিভ অর্ডার পাওয়া যায়নি।")
+                    # যদি সেশন না থাকে কিন্তু ইউজার কনফার্ম লেখে
+                    send_message(token, sender, "আপনার কোনো অর্ডার প্রসেসিংয়ে নেই। নতুন করে অর্ডার করতে পণ্যের নাম বলুন।")
                 continue
 
-            if text == "cancel":
+            if "cancel" in text or "বাতিল" in text:
                 delete_session_from_db(session_id)
                 send_message(token, sender, "আপনার অর্ডারটি বাতিল করা হয়েছে।")
                 continue
 
-            # --- AI REPLY GENERATION ---
+            # --- AI REPLY ---
             reply, product_image = generate_ai_reply_with_retry(admin_id, sender, raw_text)
             
-            # ১. আগে ইমেজ পাঠানো (যদি থাকে)
+            # Send Image First (if any)
             if product_image:
                 send_image(token, sender, product_image)
             
-            # ২. তারপর টেক্সট রিপ্লাই পাঠানো
+            # Send Text Reply
             send_message(token, sender, reply)
 
-            # --- AUTO EXTRACTION LOGIC ---
-            # বট যদি কনফার্ম করতে বলে, তখন আমরা ডাটা এক্সট্র্যাক্ট করার চেষ্টা করব
-            if "confirm" in reply.lower() or "অর্ডার" in reply:
-                memory = get_chat_memory(admin_id, sender)
-                extracted = extract_order_data_with_retry(admin_id, memory)
+            # --- DATA EXTRACTION & SESSION UPDATE ---
+            # বট যদি কনফার্ম করতে বলে, তার মানে ইউজারের সব তথ্য (নাম, ফোন, ঠিকানা) দেওয়া শেষ।
+            # অথবা ইউজার যদি নিজেই নাম/ঠিকানা দেয়।
+            
+            memory = get_chat_memory(admin_id, sender)
+            extracted = extract_order_data_with_retry(admin_id, memory)
+            
+            if extracted and extracted.get("name") and extracted.get("phone") and extracted.get("address"):
+                business = get_business_settings(admin_id)
+                products_db = get_products_with_details(admin_id)
+                delivery_charge = business.get('delivery_charge', 60) if business else 60
                 
-                if extracted and extracted.get("name") and extracted.get("phone"):
-                    business = get_business_settings(admin_id)
-                    products_db = get_products_with_details(admin_id)
-                    delivery_charge = business.get('delivery_charge', 60) if business else 60
-                    
-                    new_session = OrderSession(admin_id, sender)
-                    new_session.data.update(extracted)
-                    
-                    items_total = 0
-                    summary_list = []
-                    
-                    # প্রাইস ক্যালকুলেশন
-                    for item in extracted.get('items', []):
-                        for p in products_db:
-                            # নাম ম্যাচিং (Case insensitive)
-                            if item['product_name'].lower() in p['name'].lower():
-                                line_total = p['price'] * int(item.get('quantity', 1))
-                                items_total += line_total
-                                summary_list.append(f"{p['name']} x{item['quantity']}")
-                                break
-                    
-                    if items_total > 0:
-                        new_session.data['delivery_charge'] = delivery_charge
-                        new_session.data['total'] = items_total + delivery_charge
-                        new_session.data['product'] = ", ".join(summary_list)
-                        new_session.step = 1
-                        save_session_to_db(new_session)
+                new_session = OrderSession(admin_id, sender)
+                new_session.data.update(extracted)
+                
+                items_total = 0
+                summary_list = []
+                
+                # Calculate Total
+                for item in extracted.get('items', []):
+                    for p in products_db:
+                        if item['product_name'] and p['name'] and item['product_name'].lower() in p['name'].lower():
+                            qty = int(item.get('quantity', 1))
+                            items_total += p['price'] * qty
+                            summary_list.append(f"{p['name']} x{qty}")
+                            break
+                
+                if items_total > 0:
+                    new_session.data['delivery_charge'] = delivery_charge
+                    new_session.data['total'] = items_total + delivery_charge
+                    new_session.data['product'] = ", ".join(summary_list)
+                    new_session.step = 1
+                    save_session_to_db(new_session)
 
     return jsonify({"ok": True}), 200
 
