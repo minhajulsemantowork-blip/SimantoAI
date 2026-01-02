@@ -26,10 +26,10 @@ except Exception as e:
 
 # ================= SESSION DB HELPERS =================
 class OrderSession:
-    def __init__(self, admin_id: str, customer_id: str):
-        self.admin_id = admin_id
+    def __init__(self, user_id: str, customer_id: str):
+        self.user_id = user_id
         self.customer_id = customer_id
-        self.session_id = f"order_{admin_id}_{customer_id}"
+        self.session_id = f"order_{user_id}_{customer_id}"
         self.step = 0 
         self.data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
 
@@ -37,7 +37,7 @@ class OrderSession:
         try:
             # Save final order to 'orders' table
             res = supabase.table("orders").insert({
-                "user_id": self.admin_id,
+                "user_id": self.user_id,
                 "customer_name": self.data.get("name"),
                 "customer_phone": self.data.get("phone"),
                 "product": self.data.get("product"), 
@@ -56,7 +56,8 @@ def get_session_from_db(session_id: str) -> Optional[OrderSession]:
         res = supabase.table("order_sessions").select("*").eq("id", session_id).execute()
         if res.data:
             row = res.data[0]
-            session = OrderSession(row['admin_id'], row['customer_id'])
+            # Column name changed to user_id
+            session = OrderSession(row['user_id'], row['customer_id'])
             session.step = row['step']
             # Ensure data dict has all keys to avoid errors
             default_data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
@@ -71,7 +72,7 @@ def save_session_to_db(session: OrderSession):
     try:
         supabase.table("order_sessions").upsert({
             "id": session.session_id,
-            "admin_id": session.admin_id,
+            "user_id": session.user_id,
             "customer_id": session.customer_id,
             "step": session.step,
             "data": session.data,
@@ -117,35 +118,35 @@ def send_image(token, user_id, image_url):
         logger.error(f"Failed to send image: {e}")
 
 # ================= DATA FETCHERS =================
-def get_products_with_details(admin_id: str):
-    res = supabase.table("products").select("*").eq("user_id", admin_id).execute()
+def get_products_with_details(user_id: str):
+    res = supabase.table("products").select("*").eq("user_id", user_id).execute()
     return res.data or []
 
-def get_faqs(admin_id: str):
-    res = supabase.table("faqs").select("question, answer").eq("user_id", admin_id).execute()
+def get_faqs(user_id: str):
+    res = supabase.table("faqs").select("question, answer").eq("user_id", user_id).execute()
     return res.data or []
 
-def get_business_settings(admin_id: str) -> Optional[Dict]:
-    res = supabase.table("business_settings").select("*").eq("user_id", admin_id).limit(1).execute()
+def get_business_settings(user_id: str) -> Optional[Dict]:
+    res = supabase.table("business_settings").select("*").eq("user_id", user_id).limit(1).execute()
     return res.data[0] if res.data else None
 
-def get_chat_memory(admin_id: str, customer_id: str, limit: int = 10) -> List[Dict]:
-    res = supabase.table("chat_history").select("messages").eq("user_id", admin_id).eq("customer_id", customer_id).limit(1).execute()
+def get_chat_memory(user_id: str, customer_id: str, limit: int = 10) -> List[Dict]:
+    res = supabase.table("chat_history").select("messages").eq("user_id", user_id).eq("customer_id", customer_id).limit(1).execute()
     return res.data[0].get("messages", [])[-limit:] if res.data else []
 
-def save_chat_memory(admin_id: str, customer_id: str, messages: List[Dict]):
+def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
     now = datetime.utcnow().isoformat()
-    existing = supabase.table("chat_history").select("id").eq("user_id", admin_id).eq("customer_id", customer_id).execute()
+    existing = supabase.table("chat_history").select("id").eq("user_id", user_id).eq("customer_id", customer_id).execute()
     if existing.data:
         supabase.table("chat_history").update({"messages": messages, "last_updated": now}).eq("id", existing.data[0]["id"]).execute()
     else:
-        supabase.table("chat_history").insert({"user_id": admin_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
+        supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
 # ================= AI LOGIC (SMART CONTEXT) =================
-def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, current_session_data, max_retries=3):
-    business = get_business_settings(admin_id)
-    products = get_products_with_details(admin_id)
-    faqs = get_faqs(admin_id)
+def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=3):
+    business = get_business_settings(user_id)
+    products = get_products_with_details(user_id)
+    faqs = get_faqs(user_id)
     
     # Business Info
     biz_phone = business.get('contact_number', '') if business else ""
@@ -156,7 +157,6 @@ def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, current_sessio
     faq_text = "\n".join([f"Q: {f['question']} | A: {f['answer']}" for f in faqs])
 
     # === DYNAMIC STATUS CHECK ===
-    # চেক করা হচ্ছে আমাদের কাছে ইতিমধ্যে কি কি তথ্য আছে
     has_name = bool(current_session_data.get("name"))
     has_phone = bool(current_session_data.get("phone"))
     has_address = bool(current_session_data.get("address"))
@@ -167,7 +167,7 @@ def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, current_sessio
 
     missing_info_instruction = ""
     if not has_name or not has_phone or not has_address:
-        missing_info_instruction = "যদি গ্রাহক অর্ডার করতে চায়, তবে বিনীতভাবে বাকি তথ্যগুলো (নাম/ফোন/ঠিকানা) দিন।"
+        missing_info_instruction = "যদি গ্রাহক অর্ডার করতে চায়, তবে বিনীতভাবে বাকি তথ্যগুলো (নাম/ফোন/ঠিকানা) দিন।"
     else:
         missing_info_instruction = "আপনার কাছে গ্রাহকের নাম, ফোন এবং ঠিকানা আছে। **নতুন করে আর চাইবেন না।** সরাসরি অর্ডার সামারি দেখান এবং কনফার্ম করতে বলুন।"
 
@@ -180,15 +180,15 @@ def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, current_sessio
         f"৩. {known_info_str}\n"
         f"৪. {missing_info_instruction}\n"
         "৫. যদি গ্রাহকের নাম, ফোন এবং ঠিকানা সব থাকে, তবে তাকে পূর্ণাঙ্গ অর্ডার সামারি (পণ্যের নাম, দাম, ডেলিভারি চার্জ সহ) দেখান এবং 'Confirm' লিখতে বলুন।\n"
-        f"৬. যদি পণ্যের তথ্যের বাইরে কিছু জানতে চায় যা আপনার জানা নেই, তবে কল করতে বলুন: {biz_phone}।\n"
+        f"৬. যদি পণ্যের তথ্যের বাইরে কিছু জানতে চায় যা আপনার জানা নেই, তবে কল করতে বলুন: {biz_phone}।\n"
         f"\n[পণ্যের তালিকা]:\n{product_text}\n\n[FAQ]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
     )
 
-    memory = get_chat_memory(admin_id, customer_id)
-    api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
+    memory = get_chat_memory(user_id, customer_id)
+    api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", user_id).execute()
     
     if not api_key_res.data:
-        return "সিস্টেমের ত্রুটির কারণে উত্তর দেওয়া সম্ভব হচ্ছে না।", None
+        return "সিস্টেমের ত্রুটির কারণে উত্তর দেওয়া সম্ভব হচ্ছে না।", None
 
     client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key_res.data[0]["groq_api_key"])
 
@@ -200,7 +200,7 @@ def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, current_sessio
                 temperature=0.6 
             )
             reply = res.choices[0].message.content.strip()
-            save_chat_memory(admin_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
+            save_chat_memory(user_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
             
             matched_image = None
             for p in products:
@@ -217,13 +217,12 @@ def generate_ai_reply_with_retry(admin_id, customer_id, user_msg, current_sessio
             return "দুঃখিত, সার্ভার ব্যস্ত। একটু পরে চেষ্টা করুন।", None
 
 # ================= ORDER EXTRACTION =================
-def extract_order_data_with_retry(admin_id, messages, max_retries=2):
-    api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", admin_id).execute()
+def extract_order_data_with_retry(user_id, messages, max_retries=2):
+    api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", user_id).execute()
     if not api_key_res.data: return None
     
     client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key_res.data[0]["groq_api_key"])
 
-    # এই প্রম্পটটি শুধুমাত্র নতুন তথ্য খুঁজে বের করবে
     prompt = (
         "Extract order details from the conversation into JSON. "
         "Keys: name, phone, address, items (product_name, quantity). "
@@ -255,7 +254,8 @@ def webhook():
         page_id = entry.get("id")
         page = get_page_client(page_id)
         if not page: continue
-        admin_id, token = page["user_id"], page["page_access_token"]
+        # user_id variable is consistent here
+        user_id, token = page["user_id"], page["page_access_token"]
 
         for msg_event in entry.get("messaging", []):
             sender = msg_event["sender"]["id"]
@@ -265,45 +265,30 @@ def webhook():
             if not raw_text: continue
             text = raw_text.lower().strip()
 
-            session_id = f"order_{admin_id}_{sender}"
-            # 1. সেশন বা মেমোরি আগেই লোড করা হচ্ছে
+            session_id = f"order_{user_id}_{sender}"
             current_session = get_session_from_db(session_id)
             
-            # যদি সেশন না থাকে, তবে একটি খালি সেশন অবজেক্ট তৈরি করি (ডাটাবেসে সেভ না করে)
-            # যাতে AI কে খালি ডাটা পাঠানো যায়
             if not current_session:
-                current_session = OrderSession(admin_id, sender)
+                current_session = OrderSession(user_id, sender)
 
-            # --- DATA EXTRACTION (প্রতি মেসেজেই চেক করবে নতুন ইনফো আছে কিনা) ---
-            # এটি AI রিপ্লাই জেনারেট করার আগেই রান হবে, যাতে AI আপডেটেড তথ্য পায়
-            memory = get_chat_memory(admin_id, sender)
-            
-            # মেমোরিতে বর্তমান মেসেজটি টেম্পোরারি যোগ করে এক্সট্র্যাক্ট করা
+            memory = get_chat_memory(user_id, sender)
             temp_memory = memory + [{"role": "user", "content": raw_text}]
-            extracted = extract_order_data_with_retry(admin_id, temp_memory)
+            extracted = extract_order_data_with_retry(user_id, temp_memory)
             
             if extracted:
-                # শুধু নতুন পাওয়া তথ্যগুলো আপডেট হবে, পুরনো তথ্য মুছবে না
                 if extracted.get("name"): current_session.data["name"] = extracted["name"]
                 if extracted.get("phone"): current_session.data["phone"] = extracted["phone"]
                 if extracted.get("address"): current_session.data["address"] = extracted["address"]
-                
-                # আইটেম আপডেট লজিক
                 if extracted.get("items"):
-                    # সাধারণ লজিক: নতুন আইটেম আসলে রিপ্লেস করা (চাইলে অ্যাপেন্ড করা যায়)
                     current_session.data["items"] = extracted["items"]
                 
-                # সেশন আপডেট করা (কিন্তু স্টেপ ১ না হওয়া পর্যন্ত কনফার্ম নয়)
                 save_session_to_db(current_session)
-
 
             # --- COMMAND HANDLING ---
             if "confirm" in text or "কনফার্ম" in text:
                 if current_session.data.get("name") and current_session.data.get("phone"):
-                    
-                    # টোটাল প্রাইস ক্যালকুলেশন (Confirm এর সময় ফাইনাল চেক)
-                    products_db = get_products_with_details(admin_id)
-                    business = get_business_settings(admin_id)
+                    products_db = get_products_with_details(user_id)
+                    business = get_business_settings(user_id)
                     delivery_charge = business.get('delivery_charge', 60) if business else 60
                     
                     items_total = 0
@@ -323,22 +308,21 @@ def webhook():
                         current_session.data['product'] = ", ".join(summary_list)
                     
                     if current_session.save_order():
-                        send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ।")
+                        send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ।")
                         delete_session_from_db(session_id)
                     else:
-                        send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+                        send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
                 else:
-                    send_message(token, sender, "আপনার অর্ডার কনফার্ম করার জন্য নাম এবং ফোন নম্বর প্রয়োজন।")
+                    send_message(token, sender, "আপনার অর্ডার কনফার্ম করার জন্য নাম এবং ফোন নম্বর প্রয়োজন।")
                 continue
 
             if "cancel" in text or "বাতিল" in text:
                 delete_session_from_db(session_id)
-                send_message(token, sender, "আপনার অর্ডারটি বাতিল করা হয়েছে।")
+                send_message(token, sender, "আপনার অর্ডারটি বাতিল করা হয়েছে।")
                 continue
 
-            # --- AI REPLY GENERATION ---
-            # আপডেটেড সেশন ডাটা পাঠানো হচ্ছে, যাতে AI জানে কি কি তথ্য আছে
-            reply, product_image = generate_ai_reply_with_retry(admin_id, sender, raw_text, current_session.data)
+            # AI REPLY
+            reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
             
             if product_image:
                 send_image(token, sender, product_image)
