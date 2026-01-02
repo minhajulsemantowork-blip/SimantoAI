@@ -12,6 +12,7 @@ from supabase import create_client, Client
 from difflib import SequenceMatcher
 import requests
 from urllib.parse import quote
+from cachetools import TTLCache, cached
 
 # ================= CONFIG =================
 logging.basicConfig(
@@ -44,6 +45,13 @@ class Config:
     URGENCY_KEYWORDS = ['আজ', 'এখন', 'দ্রুত', 'সীমিত', 'শেষ', 'অফার']
     SOCIAL_PROOF_KEYWORDS = ['জনপ্রিয়', 'বিক্রিত', 'রিভিউ', 'রেটিং', 'ক্রেতা']
     SCARCITY_KEYWORDS = ['স্টক শেষ', 'সীমিত সময়', 'শেষ চান্স', 'ফিনিশিং']
+
+# Cache configurations
+page_client_cache = TTLCache(maxsize=256, ttl=180)
+products_cache = TTLCache(maxsize=512, ttl=300)
+faq_cache = TTLCache(maxsize=256, ttl=300)
+business_settings_cache = TTLCache(maxsize=128, ttl=300)
+promotions_cache = TTLCache(maxsize=128, ttl=300)
 
 # ================= SUPABASE =================
 try:
@@ -129,7 +137,7 @@ def call_groq_with_retry(client, messages, tools=None, max_retries=3):
     return None
 
 # ================= HELPERS =================
-@lru_cache(maxsize=256, ttl=180)
+@cached(cache=page_client_cache)
 def get_page_client_cached(page_id: str) -> Optional[Dict]:
     """Fetch Facebook page integration details with caching"""
     if supabase is None:
@@ -201,7 +209,7 @@ def send_message(token: str, user_id: str, text: str) -> bool:
     """Send simple text message"""
     return send_message_with_buttons(token, user_id, text)
 
-@lru_cache(maxsize=512, ttl=300)
+@cached(cache=products_cache)
 def get_products_with_details_cached(admin_id: str) -> List[Dict]:
     """Fetch all products for a specific business with caching"""
     if supabase is None:
@@ -268,7 +276,7 @@ def get_product_by_name(admin_id: str, product_name: str) -> Optional[Dict]:
         logger.error(f"Error finding product: {e}")
         return None
 
-@lru_cache(maxsize=256, ttl=300)
+@cached(cache=faq_cache)
 def find_faq_cached(admin_id: str, user_msg: str) -> Optional[str]:
     """Find FAQ answer using similarity matching with caching"""
     if supabase is None:
@@ -297,7 +305,7 @@ def find_faq_cached(admin_id: str, user_msg: str) -> Optional[str]:
         logger.error(f"Error finding FAQ: {e}")
         return None
 
-@lru_cache(maxsize=128, ttl=300)
+@cached(cache=business_settings_cache)
 def get_business_settings_cached(admin_id: str) -> Optional[Dict]:
     """Fetch business settings from database with caching"""
     if supabase is None:
@@ -318,7 +326,7 @@ def get_business_settings_cached(admin_id: str) -> Optional[Dict]:
         logger.error(f"Error fetching business settings: {e}")
         return None
 
-@lru_cache(maxsize=128, ttl=300)
+@cached(cache=promotions_cache)
 def get_sales_promotions_cached(admin_id: str) -> List[Dict]:
     """Get active sales promotions"""
     if supabase is None:
