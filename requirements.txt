@@ -4,3 +4,4 @@ openai==1.58.1
 langdetect==1.0.9
 python-dotenv==0.21.1
 requests==2.32.5
+cachetools==5.3.1
