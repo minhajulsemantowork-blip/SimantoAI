@@ -24,6 +24,28 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
+# ================= SUBSCRIPTION CHECKER (NEW) =================
+def check_subscription_status(user_id: str) -> bool:
+    """
+    Checks if the user (business owner) has an active subscription.
+    Returns True if active, False otherwise.
+    """
+    try:
+        # Status চেক করা হচ্ছে
+        res = supabase.table("subscriptions").select("status").eq("user_id", user_id).execute()
+        
+        # যদি ডাটা থাকে এবং স্ট্যাটাস 'active' হয়
+        if res.data and len(res.data) > 0:
+            status = res.data[0].get("status")
+            if status == "active":
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error(f"Subscription Check Error for user {user_id}: {e}")
+        # সেফটির জন্য False রিটার্ন করছি যাতে পেমেন্ট ছাড়া সার্ভিস না পায়
+        return False
+
 # ================= SESSION DB HELPERS =================
 class OrderSession:
     def __init__(self, user_id: str, customer_id: str):
@@ -33,7 +55,7 @@ class OrderSession:
         self.step = 0 
         self.data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
 
-    def save_order(self) -> bool:
+    def save_order(self, product_total: float, delivery_charge: float) -> bool:
         try:
             res = supabase.table("orders").insert({
                 "user_id": self.user_id,
@@ -41,7 +63,8 @@ class OrderSession:
                 "customer_phone": self.data.get("phone"),
                 "product": self.data.get("product"), 
                 "address": self.data.get("address"),
-                "total": float(self.data.get("total", 0)),
+                "total": float(product_total),
+                "delivery_charge": float(delivery_charge),
                 "status": "pending",
                 "created_at": datetime.utcnow().isoformat()
             }).execute()
@@ -149,26 +172,30 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
     delivery_charge = business.get('delivery_charge', 60) if business else 60
 
-    product_text = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}\n  বিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
+    product_list_short = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}" for p in products if p.get("in_stock")])
+    product_details_full = "\n".join([f"পণ্য: {p.get('name')}\nদাম: ৳{p.get('price')}\nবিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
     faq_text = "\n".join([f"Q: {f['question']} | A: {f['answer']}" for f in faqs])
 
     has_name = bool(current_session_data.get("name"))
     has_phone = bool(current_session_data.get("phone"))
     has_address = bool(current_session_data.get("address"))
     
-    known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name')}, ফোন: {current_session_data.get('phone')}, ঠিকানা: {current_session_data.get('address')}." if (has_name or has_phone or has_address) else ""
+    known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
-    # === UPDATED SYSTEM PROMPT (Points 1, 2, 3 incorporated) ===
     system_prompt = (
-        f"আপনি '{business_name}'-এর একজন বন্ধুসুলভ এবং পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
-        "**আচরণবিধি:**\n"
-        "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন। উত্তর হবে সুন্দর ও সংক্ষিপ্ত (সাধারণত ৩-৪ লাইনের এক প্যারাগ্রাফে)। পণ্যের বিবরণ বা সামারির ক্ষেত্রে বড় উত্তর প্রযোজ্য।\n"
-        "২. পণ্যের নাম ডাটাবেসে ঠিক যেভাবে (Exact Name) আছে সেভাবেই ব্যবহার করুন। ইংরেজি নাম থাকলে ইংরেজিতেই লিখবেন, বাংলায় অনুবাদ করবেন না।\n"
-        "৩. গ্রাহক যদি শুধু প্রশ্ন করে, তবে শুধু উত্তর দিন। যতক্ষণ গ্রাহক স্পষ্টভাবে 'কিনতে চাই' বা 'অর্ডার দিন' বলছে না, ততক্ষণ অর্ডার সামারি দেখাবেন না এবং 'Confirm' লিখতে বলবেন না।\n"
-        f"৪. {known_info_str}\n"
-        "৫. গ্রাহক স্পষ্টভাবে অর্ডার করতে চাইলে এবং নাম/ফোন/ঠিকানা সব থাকলে তবেই সামারি দেখিয়ে 'Confirm' লিখতে বলুন।\n"
-        f"৬. তথ্যের বাইরে কিছু জানতে চাইলে কল করতে বলুন: {biz_phone}।\n"
-        f"\n[পণ্যের তালিকা]:\n{product_text}\n\n[FAQ]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
+        f"আপনার নাম Simanto, আপনি '{business_name}'-এর একজন বন্ধুসুলভ এবং পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
+        "**আচরণবিধি ও নিয়মাবলী:**\n"
+        "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন। উত্তর হবে সুন্দর ও সংক্ষিপ্ত।\n"
+        "২. পণ্যের নাম ডাটাবেসে ঠিক যেভাবে (Exact Name) আছে সেভাবেই ব্যবহার করুন। ইংরেজি নাম থাকলে ইংরেজিতেই লিখবেন।\n"
+        "৩. গ্রাহক যখন পণ্যের তালিকা (List) চাইবে, তখন নিচের '[সংক্ষিপ্ত তালিকা]' থেকে শুধু নাম ও দাম দেখান। বিবরণ দেখাবেন না।\n"
+        "৪. গ্রাহক যখন কোনো নির্দিষ্ট পণ্য নিয়ে প্রশ্ন করবে, তখন '[বিস্তারিত ডেটাবেস]' থেকে ওই পণ্যের বিবরণ হুবহু বলুন। নিজে থেকে কিছু বানিয়ে বলবেন না।\n"
+        "৫. যতক্ষণ গ্রাহক স্পষ্টভাবে 'কিনতে চাই' বা 'অর্ডার দিন' বলছে না, ততক্ষণ অর্ডার সামারি দেখাবেন না।\n"
+        "৬. গ্রাহক অর্ডার করতে চাইলে এবং নাম/ফোন/ঠিকানা সব থাকলে তবেই সামারি দেখান। সামারিতে পণ্যের দামের সাথে গ্রাহকের নাম, ফোন ও ঠিকানাও উল্লেখ করুন।\n"
+        f"৭. {known_info_str} (গ্রাহক চাইলে এই তথ্য পরিবর্তন করতে পারে, তখন নতুন তথ্য নিয়ে আপডেট করুন)।\n"
+        f"৮. তথ্যের বাইরে কিছু জানতে চাইলে কল করতে বলুন: {biz_phone}।\n"
+        f"\n[সংক্ষিপ্ত তালিকা (List)]:\n{product_list_short}\n"
+        f"\n[বিস্তারিত ডেটাবেস (Details)]:\n{product_details_full}\n"
+        f"\n[FAQ]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
     )
 
     memory = get_chat_memory(user_id, customer_id)
@@ -198,12 +225,11 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
             return reply, matched_image
 
         except Exception as e:
-            # === UPDATED ERROR HANDLING (Point 4 incorporated) ===
             if "429" in str(e):
                 if i < max_retries - 1:
                     time.sleep(20)
                     continue
-                return "দুঃখিত, সার্ভার এখন খুব ব্যস্ত। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।", None
+                return "দুঃখিত, সার্ভার এখন খুব ব্যস্ত। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।", None
             return "দুঃখিত, প্রযুক্তিগত সমস্যা হচ্ছে। একটু পরে চেষ্টা করুন।", None
 
 # ================= ORDER EXTRACTION =================
@@ -227,7 +253,11 @@ def extract_order_data_with_retry(user_id, messages, max_retries=2):
                 response_format={"type": "json_object"},
                 temperature=0
             )
-            return json.loads(res.choices[0].message.content)
+            # FIX: Markdown clean up (just in case AI adds ```json)
+            content = res.choices[0].message.content
+            cleaned_content = re.sub(r"```json|```", "", content).strip()
+            
+            return json.loads(cleaned_content)
         except Exception:
             if i < max_retries - 1: time.sleep(2)
             continue
@@ -254,6 +284,14 @@ def webhook():
                 raw_text = msg_event["message"].get("text", "")
                 if not raw_text: continue
                 text = raw_text.lower().strip()
+
+                # === SUBSCRIPTION CHECK POINT ===
+                # এখানে চেক করা হচ্ছে সাবস্ক্রিপশন Active কিনা
+                if not check_subscription_status(user_id):
+                    # ফ্রেন্ডলি মেসেজ পাঠানো হচ্ছে
+                    send_message(token, sender, "দুঃখিত, আমি এই মুহূর্তে উত্তর দিতে পারছি না। আমাদের পেজে দেওয়া ফোন নম্বরে যোগাযোগ করুন অথবা কিছুক্ষণ পর আবার চেষ্টা করুন।")
+                    # পরবর্তী কাজ বন্ধ করে লুপ কন্টিনিউ
+                    continue
 
                 session_id = f"order_{user_id}_{sender}"
                 current_session = get_session_from_db(session_id)
@@ -291,14 +329,14 @@ def webhook():
                         
                         if items_total > 0:
                             current_session.data['delivery_charge'] = delivery_charge
-                            current_session.data['total'] = items_total + delivery_charge
+                            current_session.data['total'] = items_total + delivery_charge 
                             current_session.data['product'] = ", ".join(summary_list)
                         
-                        if current_session.save_order():
-                            send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ।")
-                            delete_session_from_db(session_id)
-                        else:
-                            send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+                            if current_session.save_order(product_total=items_total, delivery_charge=delivery_charge):
+                                send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! খুব শীঘ্রই আমরা আপনার সাথে যোগাযোগ করবো, আমাদের প্রতি আস্থা রাখার জন্য আপনাকে অসংখ্য ধন্যবাদ।")
+                                delete_session_from_db(session_id)
+                            else:
+                                send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
                     else:
                         send_message(token, sender, "আপনার অর্ডার কনফার্ম করার জন্য নাম এবং ফোন নম্বর প্রয়োজন।")
                     continue
