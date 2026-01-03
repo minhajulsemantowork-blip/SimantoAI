@@ -35,7 +35,6 @@ class OrderSession:
 
     def save_order(self) -> bool:
         try:
-            # Save final order to 'orders' table
             res = supabase.table("orders").insert({
                 "user_id": self.user_id,
                 "customer_name": self.data.get("name"),
@@ -56,10 +55,8 @@ def get_session_from_db(session_id: str) -> Optional[OrderSession]:
         res = supabase.table("order_sessions").select("*").eq("id", session_id).execute()
         if res.data:
             row = res.data[0]
-            # Column name changed to user_id
             session = OrderSession(row['user_id'], row['customer_id'])
             session.step = row['step']
-            # Ensure data dict has all keys to avoid errors
             default_data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
             default_data.update(row['data']) 
             session.data = default_data
@@ -148,7 +145,6 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     products = get_products_with_details(user_id)
     faqs = get_faqs(user_id)
     
-    # Business Info
     biz_phone = business.get('contact_number', '') if business else ""
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
     delivery_charge = business.get('delivery_charge', 60) if business else 60
@@ -156,31 +152,22 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     product_text = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}\n  বিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
     faq_text = "\n".join([f"Q: {f['question']} | A: {f['answer']}" for f in faqs])
 
-    # === DYNAMIC STATUS CHECK ===
     has_name = bool(current_session_data.get("name"))
     has_phone = bool(current_session_data.get("phone"))
     has_address = bool(current_session_data.get("address"))
     
-    known_info_str = ""
-    if has_name or has_phone or has_address:
-        known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name')}, ফোন: {current_session_data.get('phone')}, ঠিকানা: {current_session_data.get('address')}."
+    known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name')}, ফোন: {current_session_data.get('phone')}, ঠিকানা: {current_session_data.get('address')}." if (has_name or has_phone or has_address) else ""
 
-    missing_info_instruction = ""
-    if not has_name or not has_phone or not has_address:
-        missing_info_instruction = "যদি গ্রাহক অর্ডার করতে চায়, তবে বিনীতভাবে বাকি তথ্যগুলো (নাম/ফোন/ঠিকানা) দিন।"
-    else:
-        missing_info_instruction = "আপনার কাছে গ্রাহকের নাম, ফোন এবং ঠিকানা আছে। **নতুন করে আর চাইবেন না।** সরাসরি অর্ডার সামারি দেখান এবং কনফার্ম করতে বলুন।"
-
-    # === SYSTEM PROMPT ===
+    # === UPDATED SYSTEM PROMPT (Points 1, 2, 3 incorporated) ===
     system_prompt = (
         f"আপনি '{business_name}'-এর একজন বন্ধুসুলভ এবং পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
         "**আচরণবিধি:**\n"
-        "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন।\n"
-        "২. শুরুতে অযথা নাম/ঠিকানা চাইবেন না। গ্রাহক যখন পণ্য কিনতে চাইবে, তখন তথ্য চাইবেন।\n"
-        f"৩. {known_info_str}\n"
-        f"৪. {missing_info_instruction}\n"
-        "৫. যদি গ্রাহকের নাম, ফোন এবং ঠিকানা সব থাকে, তবে তাকে পূর্ণাঙ্গ অর্ডার সামারি (পণ্যের নাম, দাম, ডেলিভারি চার্জ সহ) দেখান এবং 'Confirm' লিখতে বলুন।\n"
-        f"৬. যদি পণ্যের তথ্যের বাইরে কিছু জানতে চায় যা আপনার জানা নেই, তবে কল করতে বলুন: {biz_phone}।\n"
+        "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন। উত্তর হবে সুন্দর ও সংক্ষিপ্ত (সাধারণত ৩-৪ লাইনের এক প্যারাগ্রাফে)। পণ্যের বিবরণ বা সামারির ক্ষেত্রে বড় উত্তর প্রযোজ্য।\n"
+        "২. পণ্যের নাম ডাটাবেসে ঠিক যেভাবে (Exact Name) আছে সেভাবেই ব্যবহার করুন। ইংরেজি নাম থাকলে ইংরেজিতেই লিখবেন, বাংলায় অনুবাদ করবেন না।\n"
+        "৩. গ্রাহক যদি শুধু প্রশ্ন করে, তবে শুধু উত্তর দিন। যতক্ষণ গ্রাহক স্পষ্টভাবে 'কিনতে চাই' বা 'অর্ডার দিন' বলছে না, ততক্ষণ অর্ডার সামারি দেখাবেন না এবং 'Confirm' লিখতে বলবেন না।\n"
+        f"৪. {known_info_str}\n"
+        "৫. গ্রাহক স্পষ্টভাবে অর্ডার করতে চাইলে এবং নাম/ফোন/ঠিকানা সব থাকলে তবেই সামারি দেখিয়ে 'Confirm' লিখতে বলুন।\n"
+        f"৬. তথ্যের বাইরে কিছু জানতে চাইলে কল করতে বলুন: {biz_phone}।\n"
         f"\n[পণ্যের তালিকা]:\n{product_text}\n\n[FAQ]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
     )
 
@@ -211,16 +198,18 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
             return reply, matched_image
 
         except Exception as e:
-            if "429" in str(e) and i < max_retries - 1:
-                time.sleep(30)
-                continue
-            return "দুঃখিত, সার্ভার ব্যস্ত। একটু পরে চেষ্টা করুন।", None
+            # === UPDATED ERROR HANDLING (Point 4 incorporated) ===
+            if "429" in str(e):
+                if i < max_retries - 1:
+                    time.sleep(20)
+                    continue
+                return "দুঃখিত, সার্ভার এখন খুব ব্যস্ত। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।", None
+            return "দুঃখিত, প্রযুক্তিগত সমস্যা হচ্ছে। একটু পরে চেষ্টা করুন।", None
 
 # ================= ORDER EXTRACTION =================
 def extract_order_data_with_retry(user_id, messages, max_retries=2):
     api_key_res = supabase.table("api_keys").select("groq_api_key").eq("user_id", user_id).execute()
     if not api_key_res.data: return None
-    
     client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key_res.data[0]["groq_api_key"])
 
     prompt = (
@@ -250,84 +239,80 @@ def webhook():
     data = request.get_json()
     if not data: return jsonify({"status": "error"}), 400
 
-    for entry in data.get("entry", []):
-        page_id = entry.get("id")
-        page = get_page_client(page_id)
-        if not page: continue
-        # user_id variable is consistent here
-        user_id, token = page["user_id"], page["page_access_token"]
+    # Quick 200 OK to Facebook to prevent retries
+    if data.get("object") == "page":
+        for entry in data.get("entry", []):
+            page_id = entry.get("id")
+            page = get_page_client(page_id)
+            if not page: continue
+            user_id, token = page["user_id"], page["page_access_token"]
 
-        for msg_event in entry.get("messaging", []):
-            sender = msg_event["sender"]["id"]
-            if "message" not in msg_event: continue
-            
-            raw_text = msg_event["message"].get("text", "")
-            if not raw_text: continue
-            text = raw_text.lower().strip()
-
-            session_id = f"order_{user_id}_{sender}"
-            current_session = get_session_from_db(session_id)
-            
-            if not current_session:
-                current_session = OrderSession(user_id, sender)
-
-            memory = get_chat_memory(user_id, sender)
-            temp_memory = memory + [{"role": "user", "content": raw_text}]
-            extracted = extract_order_data_with_retry(user_id, temp_memory)
-            
-            if extracted:
-                if extracted.get("name"): current_session.data["name"] = extracted["name"]
-                if extracted.get("phone"): current_session.data["phone"] = extracted["phone"]
-                if extracted.get("address"): current_session.data["address"] = extracted["address"]
-                if extracted.get("items"):
-                    current_session.data["items"] = extracted["items"]
+            for msg_event in entry.get("messaging", []):
+                sender = msg_event["sender"]["id"]
+                if "message" not in msg_event: continue
                 
-                save_session_to_db(current_session)
+                raw_text = msg_event["message"].get("text", "")
+                if not raw_text: continue
+                text = raw_text.lower().strip()
 
-            # --- COMMAND HANDLING ---
-            if "confirm" in text or "কনফার্ম" in text:
-                if current_session.data.get("name") and current_session.data.get("phone"):
-                    products_db = get_products_with_details(user_id)
-                    business = get_business_settings(user_id)
-                    delivery_charge = business.get('delivery_charge', 60) if business else 60
-                    
-                    items_total = 0
-                    summary_list = []
-                    
-                    for item in current_session.data.get('items', []):
-                        for p in products_db:
-                            if item.get('product_name') and p.get('name') and item['product_name'].lower() in p['name'].lower():
-                                qty = int(item.get('quantity', 1))
-                                items_total += p['price'] * qty
-                                summary_list.append(f"{p['name']} x{qty}")
-                                break
-                    
-                    if items_total > 0:
-                        current_session.data['delivery_charge'] = delivery_charge
-                        current_session.data['total'] = items_total + delivery_charge
-                        current_session.data['product'] = ", ".join(summary_list)
-                    
-                    if current_session.save_order():
-                        send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ।")
-                        delete_session_from_db(session_id)
+                session_id = f"order_{user_id}_{sender}"
+                current_session = get_session_from_db(session_id)
+                if not current_session:
+                    current_session = OrderSession(user_id, sender)
+
+                memory = get_chat_memory(user_id, sender)
+                temp_memory = memory + [{"role": "user", "content": raw_text}]
+                extracted = extract_order_data_with_retry(user_id, temp_memory)
+                
+                if extracted:
+                    if extracted.get("name"): current_session.data["name"] = extracted["name"]
+                    if extracted.get("phone"): current_session.data["phone"] = extracted["phone"]
+                    if extracted.get("address"): current_session.data["address"] = extracted["address"]
+                    if extracted.get("items"):
+                        current_session.data["items"] = extracted["items"]
+                    save_session_to_db(current_session)
+
+                # --- COMMAND HANDLING ---
+                if "confirm" in text or "কনফার্ম" in text:
+                    if current_session.data.get("name") and current_session.data.get("phone"):
+                        products_db = get_products_with_details(user_id)
+                        business = get_business_settings(user_id)
+                        delivery_charge = business.get('delivery_charge', 60) if business else 60
+                        
+                        items_total = 0
+                        summary_list = []
+                        for item in current_session.data.get('items', []):
+                            for p in products_db:
+                                if item.get('product_name') and p.get('name') and item['product_name'].lower() in p['name'].lower():
+                                    qty = int(item.get('quantity', 1))
+                                    items_total += p['price'] * qty
+                                    summary_list.append(f"{p['name']} x{qty}")
+                                    break
+                        
+                        if items_total > 0:
+                            current_session.data['delivery_charge'] = delivery_charge
+                            current_session.data['total'] = items_total + delivery_charge
+                            current_session.data['product'] = ", ".join(summary_list)
+                        
+                        if current_session.save_order():
+                            send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! ধন্যবাদ।")
+                            delete_session_from_db(session_id)
+                        else:
+                            send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
                     else:
-                        send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
-                else:
-                    send_message(token, sender, "আপনার অর্ডার কনফার্ম করার জন্য নাম এবং ফোন নম্বর প্রয়োজন।")
-                continue
+                        send_message(token, sender, "আপনার অর্ডার কনফার্ম করার জন্য নাম এবং ফোন নম্বর প্রয়োজন।")
+                    continue
 
-            if "cancel" in text or "বাতিল" in text:
-                delete_session_from_db(session_id)
-                send_message(token, sender, "আপনার অর্ডারটি বাতিল করা হয়েছে।")
-                continue
+                if "cancel" in text or "বাতিল" in text:
+                    delete_session_from_db(session_id)
+                    send_message(token, sender, "আপনার অর্ডারটি বাতিল করা হয়েছে।")
+                    continue
 
-            # AI REPLY
-            reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
-            
-            if product_image:
-                send_image(token, sender, product_image)
-            
-            send_message(token, sender, reply)
+                # AI REPLY
+                reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
+                if product_image:
+                    send_image(token, sender, product_image)
+                send_message(token, sender, reply)
 
     return jsonify({"ok": True}), 200
 
