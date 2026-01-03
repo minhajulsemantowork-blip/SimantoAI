@@ -15,6 +15,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
+# Global Set to track processed message IDs (Prevents Loops)
+processed_messages = set()
+
 # Supabase Client Setup
 try:
     supabase: Client = create_client(
@@ -24,26 +27,21 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
-# ================= SUBSCRIPTION CHECKER (NEW) =================
+# ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
     """
     Checks if the user (business owner) has an active subscription.
     Returns True if active, False otherwise.
     """
     try:
-        # Status চেক করা হচ্ছে
         res = supabase.table("subscriptions").select("status").eq("user_id", user_id).execute()
-        
-        # যদি ডাটা থাকে এবং স্ট্যাটাস 'active' হয়
         if res.data and len(res.data) > 0:
             status = res.data[0].get("status")
             if status == "active":
                 return True
-                
         return False
     except Exception as e:
         logger.error(f"Subscription Check Error for user {user_id}: {e}")
-        # সেফটির জন্য False রিটার্ন করছি যাতে পেমেন্ট ছাড়া সার্ভিস না পায়
         return False
 
 # ================= SESSION DB HELPERS =================
@@ -162,37 +160,39 @@ def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
     else:
         supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
-# ================= AI LOGIC (SMART CONTEXT) =================
-def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=3):
+# ================= AI LOGIC (UPDATED WITH ADDRESS & MERGED PROMPT) =================
+def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
     business = get_business_settings(user_id)
     products = get_products_with_details(user_id)
     faqs = get_faqs(user_id)
     
+    # === [UPDATE: Address added] ===
     biz_phone = business.get('contact_number', '') if business else ""
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
+    business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
     delivery_charge = business.get('delivery_charge', 60) if business else 60
 
     product_list_short = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}" for p in products if p.get("in_stock")])
     product_details_full = "\n".join([f"পণ্য: {p.get('name')}\nদাম: ৳{p.get('price')}\nবিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
     faq_text = "\n".join([f"Q: {f['question']} | A: {f['answer']}" for f in faqs])
 
-    has_name = bool(current_session_data.get("name"))
-    has_phone = bool(current_session_data.get("phone"))
-    has_address = bool(current_session_data.get("address"))
-    
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
+    # === [MERGED SYSTEM PROMPT: Natural Flow + Strict Rules] ===
     system_prompt = (
         f"আপনার নাম Simanto, আপনি '{business_name}'-এর একজন বন্ধুসুলভ এবং পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
-        "**আচরণবিধি ও নিয়মাবলী:**\n"
+        f"দোকানের ঠিকানা: {business_address}।\n"
+        "**আচরণবিধি ও নিয়মাবলী:**\n"
         "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন। উত্তর হবে সুন্দর ও সংক্ষিপ্ত।\n"
-        "২. পণ্যের নাম ডাটাবেসে ঠিক যেভাবে (Exact Name) আছে সেভাবেই ব্যবহার করুন। ইংরেজি নাম থাকলে ইংরেজিতেই লিখবেন।\n"
-        "৩. গ্রাহক যখন পণ্যের তালিকা (List) চাইবে, তখন নিচের '[সংক্ষিপ্ত তালিকা]' থেকে শুধু নাম ও দাম দেখান। বিবরণ দেখাবেন না।\n"
-        "৪. গ্রাহক যখন কোনো নির্দিষ্ট পণ্য নিয়ে প্রশ্ন করবে, তখন '[বিস্তারিত ডেটাবেস]' থেকে ওই পণ্যের বিবরণ হুবহু বলুন। নিজে থেকে কিছু বানিয়ে বলবেন না।\n"
-        "৫. যতক্ষণ গ্রাহক স্পষ্টভাবে 'কিনতে চাই' বা 'অর্ডার দিন' বলছে না, ততক্ষণ অর্ডার সামারি দেখাবেন না।\n"
-        "৬. গ্রাহক অর্ডার করতে চাইলে এবং নাম/ফোন/ঠিকানা সব থাকলে তবেই সামারি দেখান। সামারিতে পণ্যের দামের সাথে গ্রাহকের নাম, ফোন ও ঠিকানাও উল্লেখ করুন।\n"
-        f"৭. {known_info_str} (গ্রাহক চাইলে এই তথ্য পরিবর্তন করতে পারে, তখন নতুন তথ্য নিয়ে আপডেট করুন)।\n"
-        f"৮. তথ্যের বাইরে কিছু জানতে চাইলে কল করতে বলুন: {biz_phone}।\n"
+        "২. কখনো 'আমার ডাটাবেস অনুযায়ী' বা 'তথ্যে বলা আছে'—এসব যান্ত্রিক শব্দ ব্যবহার করবেন না। আপনি দোকানের মালিকের মতো পণ্য সম্পর্কে সবকিছু জানেন।\n"
+        "৩. কোনো টেক্সট বা ডেসক্রিপশন কোটেশন চিহ্নের (যেমন: \"...\") ভেতরে রাখবেন না। এটি ফেক দেখায়।\n"
+        "৪. পণ্যের নাম ডাটাবেসে ঠিক যেভাবে (Exact Name) আছে সেভাবেই ব্যবহার করুন। ইংরেজি নাম থাকলে ইংরেজিতেই লিখবেন।\n"
+        "৫. গ্রাহক যখন পণ্যের তালিকা (List) চাইবে, তখন নিচের '[সংক্ষিপ্ত তালিকা]' থেকে শুধু নাম ও দাম দেখান। বিবরণ দেখাবেন না।\n"
+        "৬. গ্রাহক যখন কোনো নির্দিষ্ট পণ্য নিয়ে প্রশ্ন করবে, তখন '[বিস্তারিত ডেটাবেস]' থেকে তথ্য নিয়ে নিজের ভাষায় সুন্দর করে গুছিয়ে বলুন। হুবহু কপি-পেস্ট করবেন না।\n"
+        "৭. যতক্ষণ গ্রাহক স্পষ্টভাবে 'কিনতে চাই' বা 'অর্ডার দিন' বলছে না, ততক্ষণ অর্ডার সামারি দেখাবেন না।\n"
+        "৮. গ্রাহক অর্ডার করতে চাইলে এবং নাম/ফোন/ঠিকানা সব থাকলে তবেই সামারি দেখান।\n"
+        f"৯. {known_info_str} (গ্রাহক চাইলে এই তথ্য পরিবর্তন করতে পারে, তখন নতুন তথ্য নিয়ে আপডেট করুন)।\n"
+        f"১০. তথ্যের বাইরে কিছু জানতে চাইলে কল করতে বলুন: {biz_phone}।\n"
         f"\n[সংক্ষিপ্ত তালিকা (List)]:\n{product_list_short}\n"
         f"\n[বিস্তারিত ডেটাবেস (Details)]:\n{product_details_full}\n"
         f"\n[FAQ]:\n{faq_text}\n\n[ডেলিভারি চার্জ]: ৳{delivery_charge}"
@@ -211,7 +211,8 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}] + memory + [{"role": "user", "content": user_msg}],
-                temperature=0.6 
+                temperature=0.7, 
+                timeout=5.0 
             )
             reply = res.choices[0].message.content.strip()
             save_chat_memory(user_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
@@ -225,12 +226,14 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
             return reply, matched_image
 
         except Exception as e:
+            logger.error(f"AI Generation Error: {e}")
             if "429" in str(e):
-                if i < max_retries - 1:
-                    time.sleep(20)
-                    continue
-                return "দুঃখিত, সার্ভার এখন খুব ব্যস্ত। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।", None
-            return "দুঃখিত, প্রযুক্তিগত সমস্যা হচ্ছে। একটু পরে চেষ্টা করুন।", None
+                return "আমি এই মুহূর্তে একটু ব্যস্ত আছি, দয়া করে ১ মিনিট পর আবার মেসেজ দিন।", None
+            
+            if i == max_retries - 1:
+                return "দুঃখিত, সার্ভারে একটু সমস্যা হচ্ছে। দয়া করে একটু পরে চেষ্টা করুন।", None
+            
+    return "দুঃখিত, প্রযুক্তিগত সমস্যা হচ্ছে।", None
 
 # ================= ORDER EXTRACTION =================
 def extract_order_data_with_retry(user_id, messages, max_retries=2):
@@ -251,15 +254,13 @@ def extract_order_data_with_retry(user_id, messages, max_retries=2):
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": prompt}] + messages[-6:], 
                 response_format={"type": "json_object"},
-                temperature=0
+                temperature=0,
+                timeout=4.0
             )
-            # FIX: Markdown clean up (just in case AI adds ```json)
             content = res.choices[0].message.content
             cleaned_content = re.sub(r"```json|```", "", content).strip()
-            
             return json.loads(cleaned_content)
         except Exception:
-            if i < max_retries - 1: time.sleep(2)
             continue
     return None
 
@@ -269,7 +270,6 @@ def webhook():
     data = request.get_json()
     if not data: return jsonify({"status": "error"}), 400
 
-    # Quick 200 OK to Facebook to prevent retries
     if data.get("object") == "page":
         for entry in data.get("entry", []):
             page_id = entry.get("id")
@@ -281,16 +281,21 @@ def webhook():
                 sender = msg_event["sender"]["id"]
                 if "message" not in msg_event: continue
                 
+                msg_id = msg_event["message"].get("mid")
+                if msg_id in processed_messages:
+                    logger.info(f"Duplicate message ignored: {msg_id}")
+                    continue
+                if msg_id:
+                    processed_messages.add(msg_id)
+                    if len(processed_messages) > 1000:
+                        processed_messages.clear()
+
                 raw_text = msg_event["message"].get("text", "")
                 if not raw_text: continue
                 text = raw_text.lower().strip()
 
-                # === SUBSCRIPTION CHECK POINT ===
-                # এখানে চেক করা হচ্ছে সাবস্ক্রিপশন Active কিনা
                 if not check_subscription_status(user_id):
-                    # ফ্রেন্ডলি মেসেজ পাঠানো হচ্ছে
-                    send_message(token, sender, "দুঃখিত, আমি এই মুহূর্তে উত্তর দিতে পারছি না। আমাদের পেজে দেওয়া ফোন নম্বরে যোগাযোগ করুন অথবা কিছুক্ষণ পর আবার চেষ্টা করুন।")
-                    # পরবর্তী কাজ বন্ধ করে লুপ কন্টিনিউ
+                    send_message(token, sender, "দুঃখিত, আমি এই মুহূর্তে উত্তর দিতে পারছি না। আমাদের পেজে দেওয়া ফোন নম্বরে যোগাযোগ করুন।")
                     continue
 
                 session_id = f"order_{user_id}_{sender}"
@@ -333,7 +338,7 @@ def webhook():
                             current_session.data['product'] = ", ".join(summary_list)
                         
                             if current_session.save_order(product_total=items_total, delivery_charge=delivery_charge):
-                                send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! খুব শীঘ্রই আমরা আপনার সাথে যোগাযোগ করবো, আমাদের প্রতি আস্থা রাখার জন্য আপনাকে অসংখ্য ধন্যবাদ।")
+                                send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! খুব শীঘ্রই আমরা আপনার সাথে যোগাযোগ করবো।")
                                 delete_session_from_db(session_id)
                             else:
                                 send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
