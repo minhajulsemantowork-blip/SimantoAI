@@ -236,7 +236,7 @@ FAQ:
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}] + memory + [{"role": "user", "content": user_msg}],
-                temperature=0.5, 
+                temperature=0.7, 
                 timeout=5.0 
             )
             reply = res.choices[0].message.content.strip()
