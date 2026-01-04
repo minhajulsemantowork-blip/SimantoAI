@@ -172,7 +172,7 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
-    system_prompt = f"""
+    system_prompt = ( f"""
 তুমি '{business_name}'-এর একজন বাস্তব মানুষ, একজন অভিজ্ঞ সেলস এক্সিকিউটিভ।
 তুমি কোনো AI, bot বা সফটওয়্যার নও—এমন কিছু কখনো বলবে না।
 
