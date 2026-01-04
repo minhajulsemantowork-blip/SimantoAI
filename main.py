@@ -15,7 +15,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# Global Set to track processed message IDs (Prevents Loops)
 processed_messages = set()
 
 # Supabase Client Setup
@@ -29,10 +28,6 @@ except Exception as e:
 
 # ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
-    """
-    Checks if the user (business owner) has an active subscription.
-    Returns True if active, False otherwise.
-    """
     try:
         res = supabase.table("subscriptions").select("status").eq("user_id", user_id).execute()
         if res.data and len(res.data) > 0:
@@ -61,7 +56,7 @@ class OrderSession:
                 "customer_phone": self.data.get("phone"),
                 "product": self.data.get("product"), 
                 "address": self.data.get("address"),
-                "total": float(product_total),
+                "total": float(product_total + delivery_charge),
                 "delivery_charge": float(delivery_charge),
                 "status": "pending",
                 "created_at": datetime.utcnow().isoformat()
@@ -160,16 +155,15 @@ def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
     else:
         supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
-# ================= AI LOGIC (UPDATED WITH ADDRESS & MERGED PROMPT) =================
+# ================= AI LOGIC =================
 def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
     business = get_business_settings(user_id)
     products = get_products_with_details(user_id)
     faqs = get_faqs(user_id)
     
-    # === [UPDATE: Address added] ===
     biz_phone = business.get('contact_number', '') if business else ""
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
-    business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
+    business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
     delivery_charge = business.get('delivery_charge', 60) if business else 60
 
     product_list_short = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}" for p in products if p.get("in_stock")])
@@ -178,19 +172,18 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
-    # === [MERGED SYSTEM PROMPT: Natural Flow + Strict Rules] ===
     system_prompt = (
-        f"আপনার নাম Simanto, আপনি '{business_name}'-এর একজন বন্ধুসুলভ এবং পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
+        f"আপনার নাম Simanto, আপনি '{business_name}'-এর একজন পেশাদার সেলস অ্যাসিস্ট্যান্ট।\n"
         f"দোকানের ঠিকানা: {business_address}।\n"
         "**আচরণবিধি ও নিয়মাবলী:**\n"
-        "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন। উত্তর হবে সুন্দর ও সংক্ষিপ্ত।\n"
+        "১. সর্বদা মার্জিত ও প্রমিত বাংলা ব্যবহার করুন। যেকোনো প্রশ্নের উত্তর হবে ২০ শব্দের মধ্যে সুন্দর ও সংক্ষিপ্ত।\n"
         "২. কখনো 'আমার ডাটাবেস অনুযায়ী' বা 'তথ্যে বলা আছে'—এসব যান্ত্রিক শব্দ ব্যবহার করবেন না। আপনি দোকানের মালিকের মতো পণ্য সম্পর্কে সবকিছু জানেন।\n"
         "৩. কোনো টেক্সট বা ডেসক্রিপশন কোটেশন চিহ্নের (যেমন: \"...\") ভেতরে রাখবেন না। এটি ফেক দেখায়।\n"
         "৪. পণ্যের নাম ডাটাবেসে ঠিক যেভাবে (Exact Name) আছে সেভাবেই ব্যবহার করুন। ইংরেজি নাম থাকলে ইংরেজিতেই লিখবেন।\n"
         "৫. গ্রাহক যখন পণ্যের তালিকা (List) চাইবে, তখন নিচের '[সংক্ষিপ্ত তালিকা]' থেকে শুধু নাম ও দাম দেখান। বিবরণ দেখাবেন না।\n"
         "৬. গ্রাহক যখন কোনো নির্দিষ্ট পণ্য নিয়ে প্রশ্ন করবে, তখন '[বিস্তারিত ডেটাবেস]' থেকে তথ্য নিয়ে নিজের ভাষায় সুন্দর করে গুছিয়ে বলুন। হুবহু কপি-পেস্ট করবেন না।\n"
         "৭. যতক্ষণ গ্রাহক স্পষ্টভাবে 'কিনতে চাই' বা 'অর্ডার দিন' বলছে না, ততক্ষণ অর্ডার সামারি দেখাবেন না।\n"
-        "৮. গ্রাহক অর্ডার করতে চাইলে এবং নাম/ফোন/ঠিকানা সব থাকলে তবেই সামারি দেখান।\n"
+        "৮. গ্রাহকের নাম, ফোন এবং ঠিকানা পাওয়া গেলে তাকে একটি অর্ডার সামারি দেখান এবং জিজ্ঞাসা করুন যে তথ্যগুলো সঠিক কি না। তাকে স্পষ্টভাবে বলুন যে অর্ডারটি নিশ্চিত করতে তাকে 'Confirm' বা 'কনফার্ম' লিখে মেসেজ দিতে হবে। অর্ডার নিশ্চিত না করা পর্যন্ত অর্ডারটি ডাটাবেসে সেভ হবে না।\n"
         f"৯. {known_info_str} (গ্রাহক চাইলে এই তথ্য পরিবর্তন করতে পারে, তখন নতুন তথ্য নিয়ে আপডেট করুন)।\n"
         f"১০. তথ্যের বাইরে কিছু জানতে চাইলে কল করতে বলুন: {biz_phone}।\n"
         f"\n[সংক্ষিপ্ত তালিকা (List)]:\n{product_list_short}\n"
@@ -211,7 +204,7 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}] + memory + [{"role": "user", "content": user_msg}],
-                temperature=0.7, 
+                temperature=0.5, 
                 timeout=5.0 
             )
             reply = res.choices[0].message.content.strip()
@@ -224,16 +217,12 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
                     break
             
             return reply, matched_image
-
         except Exception as e:
             logger.error(f"AI Generation Error: {e}")
-            if "429" in str(e):
-                return "দুঃখিত, এই মুহুর্তে আমরা উত্তর দিতে পারছিনা, দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন এবং বিশেষ প্রয়োজনে আমাদের পেজে দেওয়া কন্টাক্ট নম্বরে যোগাযোগ করুন। আমাদের সমস্যাটি বোঝার জন্য আপনাকে অসংখ্য ধন্যবাদ।", None
-            
             if i == max_retries - 1:
-                return "দুঃখিত, এই মুহুর্তে আমরা উত্তর দিতে পারছিনা, দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন এবং বিশেষ প্রয়োজনে আমাদের পেজে দেওয়া কন্টাক্ট নম্বরে যোগাযোগ করুন। আমাদের সমস্যাটি বোঝার জন্য আপনাকে অসংখ্য ধন্যবাদ।", None
+                return "দুঃখিত, এই মুহুর্তে আমরা উত্তর দিতে পারছিনা। অনুগ্রহ করে কল করুন।", None
             
-    return "দুঃখিত, এই মুহুর্তে আমরা উত্তর দিতে পারছিনা, দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন এবং বিশেষ প্রয়োজনে আমাদের পেজে দেওয়া কন্টাক্ট নম্বরে যোগাযোগ করুন। আমাদের সমস্যাটি বোঝার জন্য আপনাকে অসংখ্য ধন্যবাদ।", None
+    return "দুঃখিত, এই মুহুর্তে আমরা উত্তর দিতে পারছিনা।", None
 
 # ================= ORDER EXTRACTION =================
 def extract_order_data_with_retry(user_id, messages, max_retries=2):
@@ -265,8 +254,23 @@ def extract_order_data_with_retry(user_id, messages, max_retries=2):
     return None
 
 # ================= WEBHOOK =================
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # --- Facebook Webhook Verification ---
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        
+        # Render এর এনভায়রনমেন্ট থেকে VERIFY_TOKEN রিড করা হচ্ছে
+        verify_token = os.getenv("VERIFY_TOKEN")
+        
+        if mode == "subscribe" and token == verify_token:
+            logger.info("Webhook verified successfully!")
+            return challenge, 200
+        return "Verification failed", 403
+
+    # --- Handle Messenger Messages ---
     data = request.get_json()
     if not data: return jsonify({"status": "error"}), 400
 
@@ -282,20 +286,15 @@ def webhook():
                 if "message" not in msg_event: continue
                 
                 msg_id = msg_event["message"].get("mid")
-                if msg_id in processed_messages:
-                    logger.info(f"Duplicate message ignored: {msg_id}")
-                    continue
-                if msg_id:
-                    processed_messages.add(msg_id)
-                    if len(processed_messages) > 1000:
-                        processed_messages.clear()
+                if msg_id in processed_messages: continue
+                if msg_id: processed_messages.add(msg_id)
 
                 raw_text = msg_event["message"].get("text", "")
                 if not raw_text: continue
                 text = raw_text.lower().strip()
 
                 if not check_subscription_status(user_id):
-                    send_message(token, sender, "দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না। আমাদের পেজে দেওয়া ফোন নম্বরে যোগাযোগ করুন।")
+                    send_message(token, sender, "দুঃখিত, সার্ভিসটি বর্তমানে বন্ধ আছে।")
                     continue
 
                 session_id = f"order_{user_id}_{sender}"
@@ -303,6 +302,7 @@ def webhook():
                 if not current_session:
                     current_session = OrderSession(user_id, sender)
 
+                # সেশনে ডাটা আপডেট
                 memory = get_chat_memory(user_id, sender)
                 temp_memory = memory + [{"role": "user", "content": raw_text}]
                 extracted = extract_order_data_with_retry(user_id, temp_memory)
@@ -311,20 +311,20 @@ def webhook():
                     if extracted.get("name"): current_session.data["name"] = extracted["name"]
                     if extracted.get("phone"): current_session.data["phone"] = extracted["phone"]
                     if extracted.get("address"): current_session.data["address"] = extracted["address"]
-                    if extracted.get("items"):
-                        current_session.data["items"] = extracted["items"]
+                    if extracted.get("items"): current_session.data["items"] = extracted["items"]
                     save_session_to_db(current_session)
 
-                # --- COMMAND HANDLING ---
+                # --- COMMAND HANDLING (Strict Confirmation) ---
                 if "confirm" in text or "কনফার্ম" in text:
-                    if current_session.data.get("name") and current_session.data.get("phone"):
+                    s_data = current_session.data
+                    if s_data.get("name") and s_data.get("phone") and s_data.get("address") and s_data.get("items"):
                         products_db = get_products_with_details(user_id)
                         business = get_business_settings(user_id)
                         delivery_charge = business.get('delivery_charge', 60) if business else 60
                         
                         items_total = 0
                         summary_list = []
-                        for item in current_session.data.get('items', []):
+                        for item in s_data.get('items', []):
                             for p in products_db:
                                 if item.get('product_name') and p.get('name') and item['product_name'].lower() in p['name'].lower():
                                     qty = int(item.get('quantity', 1))
@@ -333,25 +333,24 @@ def webhook():
                                     break
                         
                         if items_total > 0:
-                            current_session.data['delivery_charge'] = delivery_charge
-                            current_session.data['total'] = items_total + delivery_charge 
                             current_session.data['product'] = ", ".join(summary_list)
-                        
                             if current_session.save_order(product_total=items_total, delivery_charge=delivery_charge):
-                                send_message(token, sender, "✅ আপনার অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে! খুব শীঘ্রই আমরা আপনার সাথে যোগাযোগ করবো।")
+                                send_message(token, sender, "✅ অভিনন্দন! আপনার অর্ডারটি সফলভাবে গ্রহণ করা হয়েছে। খুব শীঘ্রই আপনার সাথে যোগাযোগ করা হবে।")
                                 delete_session_from_db(session_id)
                             else:
-                                send_message(token, sender, "❌ অর্ডার প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+                                send_message(token, sender, "❌ কারিগরি সমস্যার কারণে অর্ডারটি সেভ করা যায়নি।")
+                        else:
+                            send_message(token, sender, "আপনার কার্টে কোনো সঠিক পণ্য পাওয়া যায়নি।")
                     else:
-                        send_message(token, sender, "আপনার অর্ডার কনফার্ম করার জন্য নাম এবং ফোন নম্বর প্রয়োজন।")
+                        send_message(token, sender, "অর্ডার কনফার্ম করতে নাম, ফোন নম্বর এবং ঠিকানা প্রয়োজন। অনুগ্রহ করে তথ্যগুলো দিন।")
                     continue
 
                 if "cancel" in text or "বাতিল" in text:
                     delete_session_from_db(session_id)
-                    send_message(token, sender, "আপনার অর্ডারটি বাতিল করা হয়েছে।")
+                    send_message(token, sender, "আপনার অর্ডার সেশনটি বাতিল করা হয়েছে।")
                     continue
 
-                # AI REPLY
+                # AI রিপ্লাই (ইউজারকে সামারি দেখাবে এবং কনফার্ম করতে বলবে)
                 reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
                 if product_image:
                     send_image(token, sender, product_image)
