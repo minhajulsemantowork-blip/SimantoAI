@@ -39,6 +39,20 @@ def check_subscription_status(user_id: str) -> bool:
         logger.error(f"Subscription Check Error for user {user_id}: {e}")
         return False
 
+# ================= BOT SETTINGS FETCHER (New Update) =================
+def get_bot_settings(user_id: str) -> Dict:
+    try:
+        res = supabase.table("bot_settings").select("*").eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            return res.data[0]
+    except Exception as e:
+        logger.error(f"Error fetching bot settings: {e}")
+    return {
+        "ai_reply_enabled": True,
+        "typing_delay": 0,
+        "welcome_message": ""
+    }
+
 # ================= SESSION DB HELPERS =================
 class OrderSession:
     def __init__(self, user_id: str, customer_id: str):
@@ -155,7 +169,7 @@ def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
     else:
         supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
-# ================= AI LOGIC =================
+# ================= AI LOGIC (Update 1: Business Details Included) =================
 def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
     business = get_business_settings(user_id)
     products = get_products_with_details(user_id)
@@ -165,6 +179,11 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
     business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
     delivery_charge = business.get('delivery_charge', 60) if business else 60
+    
+    # New columns from business_settings
+    opening_hours = business.get('opening_hours', 'তথ্য নেই') if business else "তথ্য নেই"
+    delivery_info = business.get('delivery_info', 'তথ্য নেই') if business else "তথ্য নেই"
+    payment_methods = business.get('payment_methods', []) if business else []
 
     product_list_short = "\n".join([f"- {p.get('name')}: ৳{p.get('price')}" for p in products if p.get("in_stock")])
     product_details_full = "\n".join([f"পণ্য: {p.get('name')}\nদাম: ৳{p.get('price')}\nবিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
@@ -173,41 +192,40 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
     system_prompt = ( f"""
-তুমি '{business_name}'-এর একজন বাস্তব মানুষ, একজন অভিজ্ঞ সেলস এক্সিকিউটিভ।
-তুমি কোনো AI, bot বা সফটওয়্যার নও—এমন কিছু কখনো বলবে না।
+তুমি '{business_name}'-এর একজন বাস্তব মানুষ, তোমার নাম সিমান্ত, তুমি একজন অভিজ্ঞ সেলস এক্সিকিউটিভ।
+তুমি কোনো AI, bot বা সফটওয়্যার নও—এমন কিছু কখনো বলবে না।
 
 তোমার কথা বলার ধরন:
 - খুব স্বাভাবিক, কথ্য বাংলা
 - ছোট ও পরিষ্কার বাক্য
 - WhatsApp / Messenger এ যেভাবে মানুষ কথা বলে সেভাবে
-- বেশি formal বা বইয়ের ভাষা ব্যবহার করবে না
+- বেশি formal বা বইয়ের ভাষা ব্যবহার করবে না
 
 আচরণ:
 - আগে গ্রাহকের কথা বুঝবে
 - এক উত্তরে বেশি তথ্য দেবে না
-- দরকার হলে পাল্টা প্রশ্ন করবে
-- “আচ্ছা”, “ঠিক আছে”, “বুঝেছি”, “একটু দেখি”—এগুলো ব্যবহার করবে
-- মানুষ যেমন থেমে থেমে কথা বলে, তেমন ফিল থাকবে
+- দরকার হলে পাল্টা প্রশ্ন করবেে
 
-পণ্য সংক্রান্ত নিয়ম:
+পণ্য সংক্রান্ত নিয়ম:
 - পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই ব্যবহার করবে
 - লিস্ট চাইলে শুধু নাম ও দাম দেখাবে
-- নির্দিষ্ট পণ্য জিজ্ঞেস করলে নিজের ভাষায় সুন্দর করে বোঝাবে
-- কখনো কপি-পেস্ট করবে না
+- নির্দিষ্ট পণ্য জিজ্ঞেস করলে সেই পণ্যের ডাটাবেস দেখে তথ্য গুলা নিজের ভাষায় সুন্দর করে বোঝাবে
 
 অর্ডার আচরণ:
 - গ্রাহক নিজে না চাইলে অর্ডার চাপাবে না
 - নাম, ফোন, ঠিকানা পেলে সংক্ষেপে অর্ডার সামারি দেখাবে
 - স্পষ্ট করে বলবে: অর্ডার নিশ্চিত করতে “Confirm / কনফার্ম” লিখতে হবে
-- Confirm না পাওয়া পর্যন্ত অর্ডার সেভ হবে না
+
+ব্যবসায়িক তথ্য:
+- খোলা থাকে: {opening_hours}
+- ডেলিভারি তথ্য: {delivery_info}
+- পেমেন্ট মাধ্যম: {payment_methods}
+- শপের ঠিকানা: {business_address}
+- কল করুন: {biz_phone}
+- ডেলিভারি চার্জ: ৳{delivery_charge}
 
 জানা তথ্য:
 {known_info_str}
-
-প্রয়োজনের বাইরে কিছু চাইলে বলবে:
-কল করুন: {biz_phone}
-
-ডেলিভারি চার্জ: ৳{delivery_charge}
 
 পণ্য তালিকা:
 {product_list_short}
@@ -220,7 +238,6 @@ FAQ:
 
 সব উত্তর ২–৪ লাইনের মধ্যে রাখবে।
 """
-    
     )
 
     memory = get_chat_memory(user_id, customer_id)
@@ -288,13 +305,10 @@ def extract_order_data_with_retry(user_id, messages, max_retries=2):
 # ================= WEBHOOK =================
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # --- Facebook Webhook Verification ---
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        
-        # Render এর এনভায়রনমেন্ট থেকে VERIFY_TOKEN রিড করা হচ্ছে
         verify_token = os.getenv("VERIFY_TOKEN")
         
         if mode == "subscribe" and token == verify_token:
@@ -302,7 +316,6 @@ def webhook():
             return challenge, 200
         return "Verification failed", 403
 
-    # --- Handle Messenger Messages ---
     data = request.get_json()
     if not data: return jsonify({"status": "error"}), 400
 
@@ -329,13 +342,24 @@ def webhook():
                     send_message(token, sender, "দুঃখিত, সার্ভিসটি বর্তমানে বন্ধ আছে।")
                     continue
 
+                # --- Update 2: Bot Settings Integration ---
+                bot_settings = get_bot_settings(user_id)
+                
+                # Check typing delay
+                delay_ms = bot_settings.get("typing_delay", 0)
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000)
+
+                # Check welcome message for first-time users in this session
+                memory = get_chat_memory(user_id, sender)
+                if not memory and bot_settings.get("welcome_message"):
+                    send_message(token, sender, bot_settings["welcome_message"])
+
                 session_id = f"order_{user_id}_{sender}"
                 current_session = get_session_from_db(session_id)
                 if not current_session:
                     current_session = OrderSession(user_id, sender)
 
-                # সেশনে ডাটা আপডেট
-                memory = get_chat_memory(user_id, sender)
                 temp_memory = memory + [{"role": "user", "content": raw_text}]
                 extracted = extract_order_data_with_retry(user_id, temp_memory)
                 
@@ -346,7 +370,6 @@ def webhook():
                     if extracted.get("items"): current_session.data["items"] = extracted["items"]
                     save_session_to_db(current_session)
 
-                # --- COMMAND HANDLING (Strict Confirmation) ---
                 if "confirm" in text or "কনফার্ম" in text:
                     s_data = current_session.data
                     if s_data.get("name") and s_data.get("phone") and s_data.get("address") and s_data.get("items"):
@@ -367,26 +390,27 @@ def webhook():
                         if items_total > 0:
                             current_session.data['product'] = ", ".join(summary_list)
                             if current_session.save_order(product_total=items_total, delivery_charge=delivery_charge):
-                                send_message(token, sender, "✅ অভিনন্দন! আপনার অর্ডারটি সফলভাবে গ্রহণ করা হয়েছে। খুব শীঘ্রই আপনার সাথে যোগাযোগ করা হবে।")
+                                send_message(token, sender, "✅ অভিনন্দন! আপনার অর্ডারটি সফলভাবে গ্রহণ করা হয়েছে। খুব শীঘ্রই আপনার সাথে যোগাযোগ করা হবে।")
                                 delete_session_from_db(session_id)
                             else:
-                                send_message(token, sender, "❌ কারিগরি সমস্যার কারণে অর্ডারটি সেভ করা যায়নি।")
+                                send_message(token, sender, "❌ কারিগরি সমস্যার কারণে অর্ডারটি সেভ করা যায়নি।")
                         else:
-                            send_message(token, sender, "আপনার কার্টে কোনো সঠিক পণ্য পাওয়া যায়নি।")
+                            send_message(token, sender, "আপনার কার্টে কোনো সঠিক পণ্য পাওয়া যায়নি।")
                     else:
-                        send_message(token, sender, "অর্ডার কনফার্ম করতে নাম, ফোন নম্বর এবং ঠিকানা প্রয়োজন। অনুগ্রহ করে তথ্যগুলো দিন।")
+                        send_message(token, sender, "অর্ডার কনফার্ম করতে নাম, ফোন নম্বর এবং ঠিকানা প্রয়োজন। অনুগ্রহ করে তথ্যগুলো দিন।")
                     continue
 
                 if "cancel" in text or "বাতিল" in text:
                     delete_session_from_db(session_id)
-                    send_message(token, sender, "আপনার অর্ডার সেশনটি বাতিল করা হয়েছে।")
+                    send_message(token, sender, "আপনার অর্ডার সেশনটি বাতিল করা হয়েছে।")
                     continue
 
-                # AI রিপ্লাই (ইউজারকে সামারি দেখাবে এবং কনফার্ম করতে বলবে)
-                reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
-                if product_image:
-                    send_image(token, sender, product_image)
-                send_message(token, sender, reply)
+                # Check if AI Reply is enabled
+                if bot_settings.get("ai_reply_enabled", True):
+                    reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
+                    if product_image:
+                        send_image(token, sender, product_image)
+                    send_message(token, sender, reply)
 
     return jsonify({"ok": True}), 200
 
