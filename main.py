@@ -26,7 +26,7 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
-# ================= SUBSCRIPTION CHECKER (Fixed Format Issue) =================
+# ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
     try:
         res = supabase.table("subscriptions").select("status, trial_end, end_date, paid_until").eq("user_id", user_id).execute()
@@ -41,13 +41,13 @@ def check_subscription_status(user_id: str) -> bool:
             expiry_str = sub.get("paid_until") or sub.get("end_date") or sub.get("trial_end")
             
             if expiry_str:
-                # 'T' অক্ষর এবং '+' বা 'Z' টাইমজোন চিহ্ন সরিয়ে ক্লিন করা হয়েছে
+                # 'T' অক্ষর এবং '+' বা 'Z' টাইমজোন চিহ্ন সরিয়ে ক্লিন করা হয়েছে
                 clean_date_str = expiry_str.replace('T', ' ').split('+')[0].split('Z')[0].strip()
                 
-                # তারিখ রূপান্তর (যাতে %Y-%m-%d %H:%M:%S.%f ফরম্যাটে কোনো এরর না দেয়)
+                # তারিখ রূপান্তর
                 expiry_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S.%f")
                 
-                # বর্তমান UTC সময়ের সাথে তুলনা
+                # বর্তমান UTC সময়ের সাথে তুলনা
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 
                 if now > expiry_date:
@@ -68,8 +68,11 @@ def get_bot_settings(user_id: str) -> Dict:
             return res.data[0]
     except Exception as e:
         logger.error(f"Error fetching bot settings: {e}")
+    # Default values updated to include new modes
     return {
         "ai_reply_enabled": True,
+        "hybrid_mode": True,
+        "faq_only_mode": False,
         "typing_delay": 0,
         "welcome_message": ""
     }
@@ -363,9 +366,16 @@ def webhook():
                     send_message(token, sender, "দুঃখিত, সার্ভিসটি বর্তমানে বন্ধ আছে।")
                     continue
 
-                # --- Bot Settings Integration ---
+                # --- Bot Settings & Master Switch ---
                 bot_settings = get_bot_settings(user_id)
+
+                # ১. মাস্টার সুইচ (AI Reply Enabled)
+                # যদি এটি False হয়, তবে পুরো সিস্টেম (কনফার্ম/AI/FAQ) বন্ধ থাকবে
+                if not bot_settings.get("ai_reply_enabled", True):
+                    logger.info(f"Bot system is disabled for user {user_id}")
+                    continue
                 
+                # টাইপিং ডিলে
                 delay_ms = bot_settings.get("typing_delay", 0)
                 if delay_ms > 0:
                     time.sleep(delay_ms / 1000)
@@ -424,11 +434,27 @@ def webhook():
                     send_message(token, sender, "আপনার অর্ডার সেশনটি বাতিল করা হয়েছে।")
                     continue
 
-                if bot_settings.get("ai_reply_enabled", True):
+                # --- Response Logic (Hybrid / FAQ Only) ---
+                if bot_settings.get("hybrid_mode", True):
+                    # ২. হাইব্রিড মোড (AI + Data + FAQ Context) - ডিফল্ট
                     reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
                     if product_image:
                         send_image(token, sender, product_image)
                     send_message(token, sender, reply)
+
+                elif bot_settings.get("faq_only_mode", False):
+                    # ৩. শুধু FAQ মোড (AI অফ, শুধু ডাটাবেস চেক)
+                    faqs = get_faqs(user_id)
+                    faq_reply = None
+                    for f in faqs:
+                        # সাধারণ সাবস্ট্রিং ম্যাচিং
+                        if f['question'] and f['question'].lower() in text:
+                            faq_reply = f['answer']
+                            break
+                    
+                    if faq_reply:
+                        send_message(token, sender, faq_reply)
+                    # মিল না পেলে কোনো রিপ্লাই যাবে না (Silent)
 
     return jsonify({"ok": True}), 200
 
