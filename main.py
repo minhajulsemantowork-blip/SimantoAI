@@ -5,7 +5,7 @@ import requests
 import json
 import time
 from typing import Optional, Dict, Tuple, List, Any
-from datetime import datetime
+from datetime import datetime, timezone  # ১. timezone ইমপোর্ট করা হয়েছে
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from supabase import create_client, Client
@@ -26,20 +26,43 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
-# ================= SUBSCRIPTION CHECKER =================
+# ================= SUBSCRIPTION CHECKER (Updated with Auto-Expiry) =================
 def check_subscription_status(user_id: str) -> bool:
     try:
-        res = supabase.table("subscriptions").select("status").eq("user_id", user_id).execute()
+        # ২. status এবং তারিখের কলামগুলো ডাটাবেস থেকে আনা হচ্ছে
+        res = supabase.table("subscriptions").select("status, trial_end, end_date, paid_until").eq("user_id", user_id).execute()
+        
         if res.data and len(res.data) > 0:
-            status = res.data[0].get("status")
-            if status == "active":
-                return True
+            sub = res.data[0]
+            status = sub.get("status")
+            
+            # শর্ত: স্ট্যাটাস 'active' অথবা 'trial' হতে হবে
+            if status not in ["active", "trial"]:
+                return False
+
+            # ৩. আপনার দেওয়া ফরম্যাট (2026-01-09 20:07:33.785+00) অনুযায়ী তারিখ চেক
+            expiry_str = sub.get("paid_until") or sub.get("end_date") or sub.get("trial_end")
+            
+            if expiry_str:
+                # '+' চিহ্নের পরের অংশটুকু পরিষ্কার করে ডেট অবজেক্টে রূপান্তর
+                clean_date_str = expiry_str.split('+')[0].strip()
+                expiry_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S.%f")
+                
+                # বর্তমান UTC সময়ের সাথে তুলনা (timezone-naive comparison)
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                
+                if now > expiry_date:
+                    # মেয়াদ শেষ হলে ডাটাবেসে স্ট্যাটাস আপডেট করে দেওয়া
+                    supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).execute()
+                    return False
+            
+            return True
         return False
     except Exception as e:
         logger.error(f"Subscription Check Error for user {user_id}: {e}")
         return False
 
-# ================= BOT SETTINGS FETCHER (New Update) =================
+# ================= BOT SETTINGS FETCHER =================
 def get_bot_settings(user_id: str) -> Dict:
     try:
         res = supabase.table("bot_settings").select("*").eq("user_id", user_id).limit(1).execute()
@@ -169,7 +192,7 @@ def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
     else:
         supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
-# ================= AI LOGIC (Update 1: Business Details Included) =================
+# ================= AI LOGIC =================
 def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
     business = get_business_settings(user_id)
     products = get_products_with_details(user_id)
@@ -180,7 +203,6 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
     delivery_charge = business.get('delivery_charge', 60) if business else 60
     
-    # New columns from business_settings
     opening_hours = business.get('opening_hours', 'তথ্য নেই') if business else "তথ্য নেই"
     delivery_info = business.get('delivery_info', 'তথ্য নেই') if business else "তথ্য নেই"
     payment_methods = business.get('payment_methods', []) if business else []
@@ -338,19 +360,18 @@ def webhook():
                 if not raw_text: continue
                 text = raw_text.lower().strip()
 
+                # --- Subscription Check ---
                 if not check_subscription_status(user_id):
                     send_message(token, sender, "দুঃখিত, সার্ভিসটি বর্তমানে বন্ধ আছে।")
                     continue
 
-                # --- Update 2: Bot Settings Integration ---
+                # --- Bot Settings Integration ---
                 bot_settings = get_bot_settings(user_id)
                 
-                # Check typing delay
                 delay_ms = bot_settings.get("typing_delay", 0)
                 if delay_ms > 0:
                     time.sleep(delay_ms / 1000)
 
-                # Check welcome message for first-time users in this session
                 memory = get_chat_memory(user_id, sender)
                 if not memory and bot_settings.get("welcome_message"):
                     send_message(token, sender, bot_settings["welcome_message"])
@@ -405,7 +426,6 @@ def webhook():
                     send_message(token, sender, "আপনার অর্ডার সেশনটি বাতিল করা হয়েছে।")
                     continue
 
-                # Check if AI Reply is enabled
                 if bot_settings.get("ai_reply_enabled", True):
                     reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
                     if product_image:
