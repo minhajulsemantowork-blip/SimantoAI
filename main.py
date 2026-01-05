@@ -5,7 +5,7 @@ import requests
 import json
 import time
 from typing import Optional, Dict, Tuple, List, Any
-from datetime import datetime, timezone  # ১. timezone ইমপোর্ট করা হয়েছে
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from supabase import create_client, Client
@@ -26,33 +26,31 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
-# ================= SUBSCRIPTION CHECKER (Updated with Auto-Expiry) =================
+# ================= SUBSCRIPTION CHECKER (Fixed Format Issue) =================
 def check_subscription_status(user_id: str) -> bool:
     try:
-        # ২. status এবং তারিখের কলামগুলো ডাটাবেস থেকে আনা হচ্ছে
         res = supabase.table("subscriptions").select("status, trial_end, end_date, paid_until").eq("user_id", user_id).execute()
         
         if res.data and len(res.data) > 0:
             sub = res.data[0]
             status = sub.get("status")
             
-            # শর্ত: স্ট্যাটাস 'active' অথবা 'trial' হতে হবে
             if status not in ["active", "trial"]:
                 return False
 
-            # ৩. আপনার দেওয়া ফরম্যাট (2026-01-09 20:07:33.785+00) অনুযায়ী তারিখ চেক
             expiry_str = sub.get("paid_until") or sub.get("end_date") or sub.get("trial_end")
             
             if expiry_str:
-                # '+' চিহ্নের পরের অংশটুকু পরিষ্কার করে ডেট অবজেক্টে রূপান্তর
-                clean_date_str = expiry_str.split('+')[0].strip()
+                # 'T' অক্ষর এবং '+' বা 'Z' টাইমজোন চিহ্ন সরিয়ে ক্লিন করা হয়েছে
+                clean_date_str = expiry_str.replace('T', ' ').split('+')[0].split('Z')[0].strip()
+                
+                # তারিখ রূপান্তর (যাতে %Y-%m-%d %H:%M:%S.%f ফরম্যাটে কোনো এরর না দেয়)
                 expiry_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S.%f")
                 
-                # বর্তমান UTC সময়ের সাথে তুলনা (timezone-naive comparison)
+                # বর্তমান UTC সময়ের সাথে তুলনা
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 
                 if now > expiry_date:
-                    # মেয়াদ শেষ হলে ডাটাবেসে স্ট্যাটাস আপডেট করে দেওয়া
                     supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).execute()
                     return False
             
