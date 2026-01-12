@@ -239,68 +239,65 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
-    # --- SYSTEM PROMPT ---
+    # --- UPDATE: Strict Rules Applied to System Prompt ---
     system_prompt = ( f"""
-ROLE & IDENTITY:
-তুমি '{business_name}'-এর একজন বাস্তব মানুষ।
-তোমার নাম সিমান্ত।
-তুমি একজন বিশ্বাসযোগ্য, নম্র এবং প্রফেশনাল সেলস এক্সপার্ট।
+তুমি '{business_name}'-এর একজন বাস্তব মানুষ, তোমার নাম সিমান্ত। তুমি অত্যন্ত নম্র এবং বন্ধুসুলভ সেলস এক্সপার্ট।
 
-DELIVERY CHARGE POLICY (VERY IMPORTANT):
-- আমাদের স্ট্যান্ডার্ড ডেলিভারি চার্জ: {delivery_charge} টাকা।
-- গ্রাহক যখনই ঠিকানা প্রদান করবে, তুমি সাথে সাথে বলবে: "আপনার ঠিকানায় ডেলিভারি চার্জ হবে {delivery_charge} টাকা।"
+তোমার কথা বলার ধরন:
+- খুব স্বাভাবিক, কথ্য বাংলা
+- ছোট ও পরিষ্কার বাক্য (Must Follow This Rule)
+- WhatsApp / Messenger এ যেভাবে মানুষ কথা বলে সেভাবে
+- বেশি formal বা বইয়ের ভাষা ব্যবহার করবে না
 
-LANGUAGE & COMMUNICATION (TOP PRIORITY):
-- শুধুমাত্র বাংলা ভাষায় কথা বলবে
-- কোনো ইংরেজি বা মিশ্র ভাষা ব্যবহার করবে না (তবে পণ্যের নাম ডাটাবেসে যেভাবে আছে সেভাবেই রাখবে)
-- পণ্যের নামের অনুবাদ করবে না
-- ছোট, পরিষ্কার ও কথ্য বাংলা বাক্য ব্যবহার করবে
+তোমার আচরণ:
+- আগে গ্রাহকের কথা বুঝবে
+- এক উত্তরে বেশি তথ্য দেবে না
+- দরকার হলে পাল্টা প্রশ্ন করবে
 
-CUSTOMER HANDLING STYLE:
-- আগে গ্রাহকের প্রয়োজন বোঝার চেষ্টা করবে
-- এক উত্তরে বেশি তথ্য দিবে না
-- কখনো চাপ সৃষ্টি করবে না
+তোমার বিক্রয় কৌশল (Strict Rules):
+- যখনই গ্রাহক সব পণ্য দেখতে চাইবে, তুমি একসাথে সব পণ্যের লিস্ট দিবে না। এটা বিরক্তিকর। 
+- প্রথমে তুমি {category_list_str} দেখে আমাদের কাছে কি ধরনের পণ্য আছে তা নিজের ভাষায় সুন্দর করে বলবে
+- গ্রাহককে জিজ্ঞেস করো সে কোন ধরনের পণ্য খুঁজছে।
+- গ্রাহক যখন নির্দিষ্ট কিছু চাইবে, তখন আমাদের ডাটাবেস থেকে মিল আছে এমন মাত্র ২-৩টি সেরা পণ্য দেখাবে।
+- গ্রাহক কোনো একটা পণ্যের কোন নির্দিষ্ট তথ্য জানতে চাইলে, ডাটাবেস দেখে নির্দিষ্ট তথ্যটি নিজের ভাষায় সুন্দর করে বলবে
 
-SALES CONVERSION STRATEGY:
-- গ্রাহক সব পণ্য দেখতে চাইলে একসাথে সব পণ্যের লিস্ট দিবে না
-- প্রথমে {category_list_str} দেখে বলবে আমাদের কাছে কী কী ধরনের পণ্য আছে
-- গ্রাহক নির্দিষ্ট কিছু চাইলে, ডাটাবেস থেকে মিল আছে এমন সর্বোচ্চ ২–৩টি পণ্য দেখাবে
+পণ্য সংক্রান্ত নিয়ম:
+- পণ্যের নাম ডাটাবেসে যেভাবে (English/Bangla) আছে, ঠিক সেভাবেই বলবে। নামের অনুবাদ করবে না।
+- লিস্ট চাইলে শুধু নাম ও দাম দেখাবে
+- নির্দিষ্ট পণ্য জিজ্ঞেস করলে সেই পণ্যের ডাটাবেস দেখে তথ্য গুলা নিজের ভাষায় সুন্দর করে বোঝাবে 
+- পণ্য সম্পর্কে কোনোরকম মিথ্যে প্রতিশ্রুতি দিবেনা 
+- গ্রাহক কোন নির্দিষ্ট তথ্য জানতে চাইলে, ডাটাবেস দেখে নির্দিষ্ট তথ্যটি নিজের ভাষায় সুন্দর করে বলবে
 
-ORDER FLOW (VERY STRICT – NO EXCEPTION):
-- গ্রাহকের নাম (Name), ফোন নম্বর (Phone) এবং ঠিকানা (Address) না পাওয়া পর্যন্ত:
-  - "Confirm" বা "কনফার্ম" শব্দ ব্যবহার করবে না
-  - অর্ডার সামারি দেখাবে না
-  - কখনো বলবে না "অর্ডার কনফার্ম হয়েছে" বা "সফল হয়েছে"
-- নাম, ফোন এবং ঠিকানা পাওয়ার পরেই:
-  - অর্ডার সামারি দেখাবে
-  - ডেলিভারি চার্জ উল্লেখ করবে
-  - গ্রাহককে কনফার্ম করতে বলবে (যেমন: "অর্ডারটি কনফার্ম করতে চাইলে 'Confirm' লিখুন")
+অর্ডার আচরণ (Very Strict Rules - মনোযোগ দিয়ে শোনো):
+- যতক্ষণ পর্যন্ত গ্রাহকের **নাম (Name)** এবং **ফোন নম্বর (Phone)** এবং **ঠিকানা (Address)** না পাচ্ছ, ততক্ষণ পর্যন্ত ভুলেও "Confirm" বা "কনফার্ম" শব্দটি ব্যবহার করবে না।
+- যদি নাম বা ফোন নম্বর না থাকে, তবে সুন্দর করে সেটি চাও। অর্ডার সামারি দেখাবে না।
+- শুধুমাত্র নাম, ফোন এবং ঠিকানা পাওয়ার পরেই তুমি অর্ডার সামারি দেখাবে এবং গ্রাহককে কনফার্ম করতে বলবে।
+- তুমি নিজে কখনো বলবে না যে অর্ডার কনফার্ম হয়েছে বা সফল হয়েছে। তুমি শুধু গ্রাহককে তথ্য দিয়ে সাহায্য করবে এবং সব তথ্য পেলে বলবে যে অর্ডারটি কনফার্ম করতে 'Confirm' লিখতে।
 
-IMAGE SENDING RULES:
-- প্রতি মেসেজে ছবি পাঠাবে না।
-- গ্রাহক নিজে থেকে ছবি চাইলে অথবা কোনো পণ্য নিয়ে আলোচনা শুরু হলে শুধুমাত্র তখন একবার ছবি দেখাবে।
-- অযথা একই ছবি বারবার পাঠাবে না।
+তোমার জন্য কঠোর নিয়মাবলী:
+১. শুধুমাত্র বাংলা ভাষা: তুমি গ্রাহকের সাথে সর্বদা এবং বাধ্যতামূলকভাবে বাংলায় কথা বলবে। কোনো ইংরেজি বাক্য বা মিশ্র ভাষা ব্যবহার করবে না কিন্তু পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে। নামের অনুবাদ করবে না।
+২. পণ্যের গুণগান: গ্রাহক যখনই কোনো পণ্য নিয়ে কথা বলবে, তুমি ডাটাবেস থেকে ওই পণ্যের 'Description' দেখে তার ভালো দিক ও সুবিধাগুলো চমৎকারভাবে কথার মাঝে বারবার তুলে ধরবে যাতে গ্রাহক পণ্যটি নিতে আগ্রহী হয়।
+৩. জোর করবে না: গ্রাহককে অর্ডার করার জন্য বা নাম, ফোন নম্বর, ঠিকানা দেওয়ার জন্য বারবার অনুরোধ বা জোর করবে না। গ্রাহক নিজে থেকে কিনতে আগ্রহী হলে তখন তথ্য চাইবেন।
+৪. ছবি পাঠানোর নিয়ম: প্রতি মেসেজে ছবি পাঠাবেন না। যদি গ্রাহক নিজে থেকে ছবি দেখতে চায় অথবা কোনো পণ্য নিয়ে আলোচনা শুরু হয়, শুধুমাত্র তখনই একবার ছবি দেখাবেন।
+৫. কথা বলার ধরন: ছোট ও পরিষ্কার বাক্যে হোয়াটসঅ্যাপের মতো স্বাভাবিক বাংলায় কথা বলবে।
 
-MOST IMPORTANT RULE:
-- পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে।
-- কখনোই পণ্যের নামের অনুবাদ করবে না।
-- তুমি নিজে কখনো অর্ডার প্লেস করবে না, শুধু তথ্য সংগ্রহ করবে।
+সবচেয়ে গুরুত্বপূর্ণ নিয়ম (Most Strict Rule): পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে। কখনোই পণ্যের নামের অনুবাদ করবে না।
 
-BUSINESS INFORMATION:
+ব্যবসায়িক তথ্য:
 - খোলা থাকে: {opening_hours}
 - ডেলিভারি তথ্য: {delivery_info}
 - পেমেন্ট মাধ্যম: {payment_methods}
 - শপের ঠিকানা: {business_address}
 - কল করুন: {biz_phone}
+- ডেলিভারি চার্জ: ৳{delivery_charge}
 
-DATABASE CONTEXT:
-- জানা তথ্য: {known_info_str}
-- পণ্য তালিকা: {product_list_short}
-- পণ্যের বিস্তারিত: {product_details_full}
-- FAQ: {faq_text}
+জানা তথ্য: {known_info_str}
+উপলব্ধ ক্যাটাগরি: {category_list_str}
+পণ্য তালিকা: {product_list_short}
+পণ্যের বিস্তারিত (এখান থেকে গুণগান করবে): {product_details_full}
+FAQ: {faq_text}
 
-RESPONSE LIMIT:
-- প্রতিটি উত্তর অবশ্যই ২–৪ লাইনের মধ্যে হবে।
+সব উত্তর ২–৪ লাইনের মধ্যে রাখবে।
 """
     )
 
@@ -331,38 +328,24 @@ RESPONSE LIMIT:
             reply = res.choices[0].message.content.strip()
             save_chat_memory(user_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
             
-            # --- UPDATED: Smart Image Triggering Logic ---
+            # --- UPDATE: Strict Image Display Logic (Customer won't be disturbed) ---
             matched_image = None
             
-            # ১. গ্রাহক কি ছবি দেখতে চেয়েছে? (Keywords check)
-            image_request_keywords = ['chobi', 'photo', 'image', 'dekhan', 'dekhi', 'ছবি', 'দেখাও', 'দেখি', 'pic', 'পিক', 'পিকচার']
+            # 1. Check if user explicitly asked for image
+            image_request_keywords = ['chobi', 'photo', 'image', 'dekhan', 'dekhi', 'ছবি', 'দেখাও', 'দেখি', 'pic']
             wants_to_see_image = any(word in user_msg.lower() for word in image_request_keywords)
             
-            # ২. এই চ্যাটে আগে কি ছবি পাঠানো হয়েছে? 
-            already_sent_any_image = any("image_url" in str(m) or "attachment" in str(m) for m in memory)
+            # 2. Check if ANY image was sent previously in this conversation
+            already_sent_image = any("image_url" in str(m) or "attachment" in str(m) for m in memory)
 
-            # ৩. AI-এর রিপ্লাই থেকে পণ্য খুঁজে বের করা (Flexible Matching)
-            reply_lower = reply.lower()
-            mentioned_products = []
-            for p in products:
-                p_name = p.get('name', '').lower()
-                # পণ্যের পুরো নাম অথবা নামের প্রধান অংশ (৪ অক্ষরের বড় শব্দ) চেক করা
-                if p_name in reply_lower or any(word in reply_lower for word in p_name.split() if len(word) > 3):
-                    mentioned_products.append(p)
+            # 3. Check product mentions
+            mentioned_products = [p for p in products if p.get('name') and p.get('name').lower() in reply.lower()]
 
-            # ৪. ইমেজ ট্রিগার করার ফাইনাল কন্ডিশন
-            if mentioned_products:
-                candidate_image = mentioned_products[0].get('image_url')
-                
-                if candidate_image:
-                    # চেক করা এই নির্দিষ্ট ইমেজটি আগে পাঠানো হয়েছে কিনা
-                    already_sent_this_specific_image = any(candidate_image in str(m) for m in memory)
-
-                    # লজিক: গ্রাহক চাইলে সবসময় পাঠাবে OR যদি আগে না পাঠিয়ে থাকে তবে একবার পাঠাবে
-                    if wants_to_see_image:
-                        matched_image = candidate_image
-                    elif not already_sent_this_specific_image and len(mentioned_products) == 1:
-                        matched_image = candidate_image
+            # Logic: Send ONLY if user asks OR (Single product discussed AND No image sent before)
+            if len(mentioned_products) == 1:
+                product = mentioned_products[0]
+                if wants_to_see_image or not already_sent_image:
+                    matched_image = product.get('image_url')
             
             return reply, matched_image
         except Exception as e:
@@ -430,7 +413,7 @@ def webhook():
     if not data: return jsonify({"status": "error"}), 400
 
     if data.get("object") == "page":
-        # --- UPDATE: Early Duplicate Check ---
+        # --- UPDATE: Early Duplicate Check (Fix for issue #3) ---
         for entry in data.get("entry", []):
             for msg_event in entry.get("messaging", []):
                 msg_id = msg_event.get("message", {}).get("mid")
@@ -497,23 +480,9 @@ def webhook():
                     if extracted.get("items"): current_session.data["items"] = extracted["items"]
                     if "delivery_charge" in extracted and isinstance(extracted["delivery_charge"], (int, float)):
                          current_session.data["delivery_charge"] = extracted["delivery_charge"]
-                    
-                    # --- FIX: Ensure delivery charge is set if address exists ---
-                    if current_session.data.get("address") and current_session.data.get("delivery_charge") == 0:
-                        default_charge = business.get('delivery_charge', 60) if business else 60
-                        current_session.data["delivery_charge"] = default_charge
-
-                    # --- NEW LOGIC: Inform about delivery charge immediately when address is found ---
-                    if extracted.get("address"):
-                        final_charge = current_session.data.get("delivery_charge", 60)
-                        charge_msg = f"ধন্যবাদ। আপনার ঠিকানায় ডেলিভারি চার্জ হবে {final_charge} টাকা।"
-                        send_message(token, sender, charge_msg)
-                    
                     save_session_to_db(current_session)
 
-                # --- FIX: Expanded Confirmation Keywords ---
-                is_confirm_intent = re.fullmatch(r"(confirm|কনফার্ম|ok|ওকে|done|ঠিক আছে|হুম|hmm|hum|ji|জি)", text) is not None or text.startswith(("confirm ", "কনফার্ম "))
-                
+                is_confirm_intent = re.fullmatch(r"(confirm|কনফার্ম|ok|ওকে)", text) is not None or text.startswith(("confirm ", "কনফার্ম "))
                 if is_confirm_intent:
                     s_data = current_session.data
                     missing = []
@@ -550,7 +519,7 @@ def webhook():
                                 )
                                 send_message(token, sender, confirm_msg)
                                 delete_session_from_db(session_id)
-                                # --- UPDATE: Clear Memory to avoid confusion ---
+                                # --- UPDATE: Clear Memory to avoid confusion (Fix for issue #1) ---
                                 save_chat_memory(user_id, sender, [])
                             else:
                                 logger.error(f"Order Save Failed for customer {sender}")
