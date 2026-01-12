@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from supabase import create_client, Client
+from rapidfuzz import process, fuzz  # Added RapidFuzz
 
 # ================= CONFIG =================
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +26,24 @@ try:
     )
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
+
+# ================= RAPIDFUZZ HELPER =================
+def get_best_product_match(text, products, threshold=70):
+    """
+    RapidFuzz used to find the best matching product from text.
+    Handles Banglish and fuzzy spellings.
+    """
+    if not products or not text: return None
+    
+    product_names = [p.get('name') for p in products]
+    # WRatio is best for mixed casing and partial matches
+    match = process.extractOne(text, product_names, scorer=fuzz.WRatio)
+    
+    if match and match[1] >= threshold:
+        matched_name = match[0]
+        # Find the product object
+        return next((p for p in products if p['name'] == matched_name), None)
+    return None
 
 # ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
@@ -219,11 +238,8 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
     business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
     
-    session_charge = current_session_data.get('delivery_charge', 0)
-    if session_charge > 0:
-        delivery_charge = session_charge
-    else:
-        delivery_charge = business.get('delivery_charge', 60) if business else 60
+    # Delivery Charge Logic Updated
+    delivery_charge = business.get('delivery_charge', 60) if business else 60
     
     opening_hours = business.get('opening_hours', 'তথ্য নেই') if business else "তথ্য নেই"
     delivery_info = business.get('delivery_info', 'তথ্য নেই') if business else "তথ্য নেই"
@@ -239,8 +255,8 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
-    # --- UPDATE: Strict Rules Applied to System Prompt ---
-    system_prompt = ( f"""
+    # --- UPDATE: Strict Rules Applied to System Prompt for Charge & Confirmation ---
+    system_prompt = (f"""
 ROLE & IDENTITY:
 তুমি '{business_name}'-এর একজন বাস্তব মানুষ।
 তোমার নাম সিমান্ত।
@@ -255,27 +271,25 @@ LANGUAGE & COMMUNICATION (TOP PRIORITY)
 - পণ্যের নামের অনুবাদ করবে না
 - ছোট, পরিষ্কার ও কথ্য বাংলা বাক্য ব্যবহার করবে
 - WhatsApp / Messenger-এর মতো স্বাভাবিক টোন রাখবে
-- বেশি formal বা বইয়ের ভাষা ব্যবহার করবে না
-
-====================
-CUSTOMER HANDLING STYLE
-====================
-- আগে গ্রাহকের প্রয়োজন বোঝার চেষ্টা করবে
-- এক উত্তরে বেশি তথ্য দিবে না
-- প্রয়োজন হলে ছোট পাল্টা প্রশ্ন করবে
-- কখনো চাপ সৃষ্টি করবে না
-- বন্ধুসুলভ ও সহায়ক আচরণ বজায় রাখবে
 
 ====================
 SALES CONVERSION STRATEGY (STRICT)
 ====================
-- গ্রাহক সব পণ্য দেখতে চাইলে একসাথে সব পণ্যের লিস্ট দিবে না
+- আগে গ্রাহকের প্রয়োজন বোঝার চেষ্টা করবে
+- এক উত্তরে বেশি তথ্য দিবে না
 - প্রথমে {category_list_str} দেখে নিজের ভাষায় বলবে আমাদের কাছে কী ধরনের পণ্য আছে
-- এরপর গ্রাহককে জিজ্ঞেস করবে সে কোন ধরনের পণ্য খুঁজছে
-- গ্রাহক নির্দিষ্ট কিছু চাইলে:
-  - ডাটাবেস থেকে মিল আছে এমন সর্বোচ্চ ২–৩টি সেরা পণ্য দেখাবে
-- গ্রাহক কোনো নির্দিষ্ট তথ্য চাইলে:
-  - ডাটাবেস দেখে শুধুমাত্র সেই তথ্যটি নিজের ভাষায় বলবে
+
+====================
+ORDER FLOW & CONFIRMATION (VERY STRICT)
+====================
+1. DELIVERY CHARGE:
+   - যখনই গ্রাহক তার ঠিকানা (Address) দিবে, সাথে সাথে বলবে: "আপনার এলাকায় ডেলিভারি চার্জ {delivery_charge} টাকা।"
+   - চার্জ নিয়ে লুকোচুরি করবে না।
+
+2. NO PREMATURE CONFIRMATION:
+   - গ্রাহকের নাম, ফোন নম্বর এবং ঠিকানা না পাওয়া পর্যন্ত কখনোই বলবে না "অর্ডার কনফার্ম হয়েছে"।
+   - ডাটাবেস আপডেট হওয়ার আগে "অর্ডার সফল" বলা নিষেধ।
+   - তথ্য পাওয়ার পর শুধু বলবে: "অর্ডারটি নিশ্চিত করতে 'Confirm' লিখে পাঠান"।
 
 ====================
 PRODUCT PRESENTATION RULES
@@ -283,36 +297,12 @@ PRODUCT PRESENTATION RULES
 - পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে
 - নামের অনুবাদ বা পরিবর্তন করবে না
 - লিস্ট চাইলে শুধু পণ্যের নাম ও দাম দেখাবে
-- নির্দিষ্ট পণ্য সম্পর্কে জানতে চাইলে ডাটাবেস দেখে তথ্য বোঝাবে
-- কোনো ধরনের মিথ্যা প্রতিশ্রুতি দিবে না
-- পণ্যের Description থেকে সুবিধা ও ভালো দিক কথার মাঝে স্বাভাবিকভাবে তুলে ধরবে
-
-====================
-ORDER FLOW (VERY STRICT – NO EXCEPTION)
-====================
-- গ্রাহকের নাম (Name), ফোন নম্বর (Phone) এবং ঠিকানা (Address) না পাওয়া পর্যন্ত:
-  - "Confirm" বা "কনফার্ম" শব্দ ব্যবহার করবে না
-  - অর্ডার সামারি দেখাবে না
-- নাম বা ফোন না থাকলে সুন্দরভাবে সেটি চাইবে
-- শুধুমাত্র নাম, ফোন এবং ঠিকানা পাওয়ার পরেই:
-  - অর্ডার সামারি দেখাবে
-  - গ্রাহককে কনফার্ম করতে বলবে
-- তুমি নিজে কখনো বলবে না যে অর্ডার কনফার্ম বা সফল হয়েছে
-- শুধু বলবে, অর্ডার কনফার্ম করতে 'Confirm' লিখতে
 
 ====================
 IMAGE SENDING RULES
 ====================
 - প্রতি মেসেজে ছবি পাঠাবে না
-- গ্রাহক নিজে থেকে ছবি চাইলে অথবা
-  কোনো পণ্য নিয়ে আলোচনা শুরু হলে
-  শুধুমাত্র তখন একবার ছবি দেখাবে
-
-====================
-MOST IMPORTANT RULE (OVERRIDES ALL)
-====================
-- পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে
-- কখনোই পণ্যের নামের অনুবাদ করবে না
+- গ্রাহক নিজে থেকে ছবি চাইলে অথবা কোনো পণ্য নিয়ে আলোচনা শুরু হলে তখন একবার ছবি দেখাবে
 
 ====================
 BUSINESS INFORMATION
@@ -328,17 +318,15 @@ BUSINESS INFORMATION
 DATABASE CONTEXT
 ====================
 - জানা তথ্য: {known_info_str}
-- উপলব্ধ ক্যাটাগরি: {category_list_str}
 - পণ্য তালিকা: {product_list_short}
-- পণ্যের বিস্তারিত (Description source): {product_details_full}
+- পণ্যের বিস্তারিত: {product_details_full}
 - FAQ: {faq_text}
 
 ====================
 RESPONSE LIMIT
 ====================
 - প্রতিটি উত্তর অবশ্যই ২–৪ লাইনের মধ্যে হবে
-"""
-    )
+""")
 
     memory = get_chat_memory(user_id, customer_id)
     
@@ -367,34 +355,23 @@ RESPONSE LIMIT
             reply = res.choices[0].message.content.strip()
             save_chat_memory(user_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
             
-            # --- UPDATED: Smart Image Triggering Logic ---
+            # --- UPDATED: Smart Image Triggering with RapidFuzz ---
             matched_image = None
             
-            # ১. গ্রাহক কি ছবি দেখতে চেয়েছে? (Keywords check)
             image_request_keywords = ['chobi', 'photo', 'image', 'dekhan', 'dekhi', 'ছবি', 'দেখাও', 'দেখি', 'pic', 'পিক', 'পিকচার']
             wants_to_see_image = any(word in user_msg.lower() for word in image_request_keywords)
-            
-            # ২. এই চ্যাটে আগে কি ছবি পাঠানো হয়েছে? 
             already_sent_image = any("image_url" in str(m) or "attachment" in str(m) for m in memory)
 
-            # ৩. AI-এর রিপ্লাই থেকে পণ্য খুঁজে বের করা (Flexible Matching)
-            reply_lower = reply.lower()
-            mentioned_products = []
-            for p in products:
-                p_name = p.get('name', '').lower()
-                # পণ্যের পুরো নাম অথবা নামের প্রধান অংশ (৪ অক্ষরের বড় শব্দ) চেক করা
-                if p_name in reply_lower or any(word in reply_lower for word in p_name.split() if len(word) > 3):
-                    mentioned_products.append(p)
+            # Use RapidFuzz to find product context from AI reply + User msg
+            search_context = user_msg + " " + reply
+            best_product_match = get_best_product_match(search_context, products, threshold=75)
 
-            # ৪. ইমেজ ট্রিগার করার ফাইনাল কন্ডিশন
-            if mentioned_products:
-                # যদি গ্রাহক নিজে ছবি দেখতে চায়, তবে প্রথম ম্যাচ করা পণ্যের ছবি পাঠাবে
+            if best_product_match:
                 if wants_to_see_image:
-                    matched_image = mentioned_products[0].get('image_url')
-                
-                # যদি গ্রাহক চায়নি, কিন্তু এই সেশনে একবারও ছবি পাঠানো হয়নি এবং একটি নির্দিষ্ট পণ্য নিয়ে কথা হচ্ছে (Single Product)
-                elif not already_sent_image and len(mentioned_products) == 1:
-                    matched_image = mentioned_products[0].get('image_url')
+                    matched_image = best_product_match.get('image_url')
+                elif not already_sent_image and len(user_msg.split()) < 10:
+                     # Auto trigger for short context if image not sent yet
+                    matched_image = best_product_match.get('image_url')
             
             return reply, matched_image
         except Exception as e:
@@ -462,7 +439,6 @@ def webhook():
     if not data: return jsonify({"status": "error"}), 400
 
     if data.get("object") == "page":
-        # --- UPDATE: Early Duplicate Check ---
         for entry in data.get("entry", []):
             for msg_event in entry.get("messaging", []):
                 msg_id = msg_event.get("message", {}).get("mid")
@@ -532,52 +508,52 @@ def webhook():
                     save_session_to_db(current_session)
 
                 is_confirm_intent = re.fullmatch(r"(confirm|কনফার্ম|ok|ওকে)", text) is not None or text.startswith(("confirm ", "কনফার্ম "))
+                
                 if is_confirm_intent:
                     s_data = current_session.data
                     missing = []
                     if not s_data.get("name"): missing.append("নাম")
                     if not s_data.get("phone"): missing.append("ফোন নম্বর")
                     if not s_data.get("address"): missing.append("ঠিকানা")
-                    if not s_data.get("items"): missing.append("পণ্য")
-
+                    
                     if not missing:
                         products_db = get_products_with_details(user_id)
-                        final_delivery_charge = float(s_data.get("delivery_charge", 0))
-                        if final_delivery_charge == 0:
-                            final_delivery_charge = float(business.get('delivery_charge', 60)) if business else 60
+                        # Fixed Delivery Charge Logic
+                        final_delivery_charge = float(business.get('delivery_charge', 60)) if business else 60
                         
                         items_total = 0
                         summary_list = []
+                        
+                        # --- UPDATE: RapidFuzz based item matching logic ---
                         for item in s_data.get('items', []):
-                            for p in products_db:
-                                if item.get('product_name') and p.get('name'):
-                                    if item['product_name'].lower() in p['name'].lower() or p['name'].lower() in item['product_name'].lower():
-                                        qty = int(item.get('quantity', 1))
-                                        items_total += p['price'] * qty
-                                        summary_list.append(f"{p['name']} x{qty}")
-                                        break
+                            # Use helper to find best match from DB
+                            p = get_best_product_match(item.get('product_name', ''), products_db, threshold=60)
+                            if p:
+                                qty = int(item.get('quantity', 1))
+                                items_total += (p['price'] * qty)
+                                summary_list.append(f"{p['name']} x{qty}")
 
                         if items_total > 0:
                             current_session.data['product'] = ", ".join(summary_list)
                             if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
                                 confirm_msg = (
-                                    f"✅ আপনার অর্ডারটি গ্রহণ করা হয়েছে,\n\n"
+                                    f"✅ ধন্যবাদ! আপনার অর্ডারটি গ্রহণ করা হয়েছে।\n\n"
                                     f"অর্ডার সামারি:\n{', '.join(summary_list)}\n"
-                                    f"মোট: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জ: ৳{final_delivery_charge})\n\n"
-                                    f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো। ধন্যবাদ। ❤️"
+                                    f"মোট বিল: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জসহ)\n\n"
+                                    f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো। ❤️"
                                 )
                                 send_message(token, sender, confirm_msg)
                                 delete_session_from_db(session_id)
-                                # --- UPDATE: Clear Memory to avoid confusion ---
-                                save_chat_memory(user_id, sender, [])
+                                save_chat_memory(user_id, sender, []) # Clear memory
                             else:
                                 logger.error(f"Order Save Failed for customer {sender}")
+                                send_message(token, sender, "দুঃখিত, কারিগরি ত্রুটির কারণে অর্ডারটি সেভ করা যায়নি।")
                         else:
-                            send_message(token, sender, "❌ দুঃখিত, পণ্যটি সনাক্ত করা যায়নি।")
+                            send_message(token, sender, "❌ দুঃখিত, আপনার কার্টে কোনো সঠিক পণ্য খুঁজে পাওয়া যায়নি। আবার চেষ্টা করুন।")
 
                     else:
                         needed_info = " ও ".join(missing)
-                        send_message(token, sender, f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।")
+                        send_message(token, sender, f"অর্ডার কনফার্ম করতে আপনার {needed_info} প্রয়োজন। দয়া করে তথ্যগুলো দিন।")
                     continue
 
                 if "cancel" in text or "বাতিল" in text:
