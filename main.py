@@ -4,118 +4,198 @@ import logging
 import requests
 import json
 import time
+import random
 from typing import Optional, Dict, Tuple, List, Any
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from supabase import create_client, Client
-import concurrent.futures
-from functools import lru_cache
 
 # ================= CONFIG =================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# Global in-memory cache with TTL
-class CacheWithTTL:
-    def __init__(self, ttl_seconds=300):
-        self.cache = {}
-        self.ttl = ttl_seconds
-    
-    def get(self, key):
-        if key in self.cache:
-            value, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return value
-            else:
-                del self.cache[key]
-        return None
-    
-    def set(self, key, value):
-        self.cache[key] = (value, time.time())
-    
-    def clear_old(self):
-        current = time.time()
-        self.cache = {k: v for k, v in self.cache.items() if current - v[1] < self.ttl}
+processed_messages = {}
+# API Key rotation tracking
+api_key_rotation = {}
 
-processed_messages = CacheWithTTL(300)  # 5 minutes TTL
-
-# Supabase Client Setup with connection pooling
-supabase: Optional[Client] = None
+# Supabase Client Setup
 try:
-    supabase = create_client(
+    supabase: Client = create_client(
         os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_KEY"),
-        options={"postgrest_client_timeout": 10, "storage_client_timeout": 10}
+        os.getenv("SUPABASE_SERVICE_KEY")
     )
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
-# Thread pool for async operations
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-
-# ================= CACHED DATA FETCHERS =================
-@lru_cache(maxsize=100)
-def get_cached_subscription_status(user_id: str) -> Tuple[bool, float]:
-    """Cache subscription status for 30 seconds"""
+# ================= API KEY ROTATION SYSTEM =================
+def get_rotated_api_keys(user_id: str) -> List[str]:
+    """
+    Get all valid API keys with intelligent rotation
+    """
     try:
-        res = supabase.table("subscriptions")\
-            .select("status, trial_end, end_date, paid_until")\
-            .eq("user_id", user_id)\
-            .limit(1)\
-            .execute()
+        # Get API keys from database
+        res = supabase.table("api_keys").select(
+            "groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5"
+        ).eq("user_id", user_id).execute()
         
         if not res.data:
-            return False, time.time()
+            logger.error(f"No API keys found for user {user_id}")
+            return []
         
-        sub = res.data[0]
-        status = sub.get("status")
+        row = res.data[0]
+        all_keys = [
+            row.get('groq_api_key'),
+            row.get('groq_api_key_2'), 
+            row.get('groq_api_key_3'),
+            row.get('groq_api_key_4'),
+            row.get('groq_api_key_5')
+        ]
         
-        if status not in ["active", "trial"]:
-            return False, time.time()
+        # Filter valid keys
+        valid_keys = [k.strip() for k in all_keys if k and k.strip()]
         
-        expiry_str = sub.get("paid_until") or sub.get("end_date") or sub.get("trial_end")
-        if expiry_str:
-            try:
-                # Simplified date parsing
-                clean_expiry = expiry_str.strip().replace(' ', 'T')
-                if '+00' in clean_expiry and ':00' not in clean_expiry:
-                    clean_expiry = clean_expiry.replace('+00', '+00:00')
-                
-                expiry_date = datetime.fromisoformat(clean_expiry)
-                if datetime.now(timezone.utc) > expiry_date:
-                    supabase.table("subscriptions")\
-                        .update({"status": "expired"})\
-                        .eq("user_id", user_id)\
-                        .execute()
-                    return False, time.time()
-            except Exception as e:
-                logger.error(f"Date parsing error: {e}")
-                return False, time.time()
+        if not valid_keys:
+            logger.error(f"No valid API keys for user {user_id}")
+            return []
         
-        return True, time.time()
+        # Initialize rotation tracking for this user if not exists
+        if user_id not in api_key_rotation:
+            api_key_rotation[user_id] = {
+                'keys': valid_keys,
+                'current_index': 0,
+                'last_used': {},
+                'error_count': {}
+            }
+        else:
+            # Update keys if changed
+            api_key_rotation[user_id]['keys'] = valid_keys
+        
+        return valid_keys
+        
     except Exception as e:
-        logger.error(f"Subscription check error: {e}")
-        return False, time.time()
+        logger.error(f"Error getting API keys for user {user_id}: {e}")
+        return []
 
-def check_subscription_status(user_id: str) -> bool:
-    """Wrapper with cache"""
-    cached = get_cached_subscription_status(user_id)
-    if time.time() - cached[1] > 30:  # Cache expired
-        get_cached_subscription_status.cache_clear()
-        cached = get_cached_subscription_status(user_id)
-    return cached[0]
-
-@lru_cache(maxsize=100)
-def get_cached_bot_settings(user_id: str) -> Dict:
-    """Cache bot settings for 60 seconds"""
+def get_next_api_key(user_id: str) -> Optional[str]:
+    """
+    Get next API key with round-robin rotation and error handling
+    """
     try:
-        res = supabase.table("bot_settings")\
-            .select("*")\
-            .eq("user_id", user_id)\
-            .limit(1)\
-            .execute()
+        valid_keys = get_rotated_api_keys(user_id)
+        if not valid_keys:
+            return None
+        
+        rotation_info = api_key_rotation[user_id]
+        keys = rotation_info['keys']
+        
+        # If only one key, return it
+        if len(keys) == 1:
+            return keys[0]
+        
+        # Try to find a key that hasn't had recent errors
+        current_time = time.time()
+        
+        # First, try keys without recent errors
+        for i in range(len(keys)):
+            key_index = (rotation_info['current_index'] + i) % len(keys)
+            key = keys[key_index]
+            
+            # Check if this key has recent errors
+            last_error_time = rotation_info['error_count'].get(key, 0)
+            if current_time - last_error_time > 300:  # 5 minutes cooldown
+                # Update rotation index
+                rotation_info['current_index'] = (key_index + 1) % len(keys)
+                rotation_info['last_used'][key] = current_time
+                return key
+        
+        # If all keys have recent errors, return the one with oldest error
+        oldest_error_time = float('inf')
+        best_key = keys[0]
+        
+        for key in keys:
+            error_time = rotation_info['error_count'].get(key, 0)
+            if error_time < oldest_error_time:
+                oldest_error_time = error_time
+                best_key = key
+        
+        return best_key
+        
+    except Exception as e:
+        logger.error(f"Error in API key rotation for user {user_id}: {e}")
+        valid_keys = get_rotated_api_keys(user_id)
+        return valid_keys[0] if valid_keys else None
+
+def mark_api_key_error(user_id: str, api_key: str):
+    """
+    Mark an API key as having an error (rate limit, etc.)
+    """
+    try:
+        if user_id in api_key_rotation:
+            rotation_info = api_key_rotation[user_id]
+            rotation_info['error_count'][api_key] = time.time()
+            
+            # Log the error
+            logger.warning(f"Marked API key error for user {user_id}. Key: {api_key[:20]}...")
+    except Exception as e:
+        logger.error(f"Error marking API key error: {e}")
+
+# ================= SUBSCRIPTION CHECKER =================
+def check_subscription_status(user_id: str) -> bool:
+    try:
+        res = supabase.table("subscriptions").select("status, trial_end, end_date, paid_until").eq("user_id", user_id).execute()
+        
+        if res.data and len(res.data) > 0:
+            sub = res.data[0]
+            status = sub.get("status")
+            
+            if status not in ["active", "trial"]:
+                return False
+
+            expiry_str = sub.get("paid_until") or sub.get("end_date") or sub.get("trial_end")
+            
+            if expiry_str:
+                now = datetime.now(timezone.utc)
+                try:
+                    clean_expiry = expiry_str.strip().replace(' ', 'T')
+                    if clean_expiry.endswith('+00'):
+                        clean_expiry = clean_expiry.replace('+00', '+00:00')
+
+                    try:
+                        expiry_date = datetime.fromisoformat(clean_expiry)
+                    except ValueError:
+                        clean_date_str = expiry_str.strip()
+                        if clean_date_str.endswith('+00'):
+                            clean_date_str = clean_date_str.replace('+00', '+0000')
+                        
+                        try:
+                            expiry_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S.%f%z")
+                        except ValueError:
+                            clean_date_no_tz = expiry_str.split('+')[0].strip()
+                            try:
+                                expiry_date = datetime.strptime(clean_date_no_tz, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+                            except ValueError:
+                                expiry_date = datetime.strptime(clean_date_no_tz, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                
+                except Exception as e:
+                    logger.error(f"Date Parsing Error: {e}")
+                    return False
+
+                if now > expiry_date:
+                    supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).execute()
+                    return False
+            
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Subscription Check Error for user {user_id}: {e}")
+        return False
+
+# ================= BOT SETTINGS FETCHER =================
+def get_bot_settings(user_id: str) -> Dict:
+    try:
+        res = supabase.table("bot_settings").select("*").eq("user_id", user_id).limit(1).execute()
         if res.data:
             return res.data[0]
     except Exception as e:
@@ -128,35 +208,14 @@ def get_cached_bot_settings(user_id: str) -> Dict:
         "welcome_message": ""
     }
 
-def get_bot_settings(user_id: str) -> Dict:
-    """Wrapper with cache"""
-    return get_cached_bot_settings(user_id)
-
-@lru_cache(maxsize=100)
-def get_cached_products(user_id: str) -> List[Dict]:
-    """Cache products for 120 seconds"""
-    try:
-        res = supabase.table("products")\
-            .select("*")\
-            .eq("user_id", user_id)\
-            .execute()
-        return res.data or []
-    except Exception as e:
-        logger.error(f"Error fetching products: {e}")
-        return []
-
-def get_products_with_details(user_id: str) -> List[Dict]:
-    """Wrapper with cache"""
-    return get_cached_products(user_id)
-
-# ================= SESSION DB HELPERS (OPTIMIZED) =================
+# ================= SESSION DB HELPERS =================
 class OrderSession:
     def __init__(self, user_id: str, customer_id: str):
         self.user_id = user_id
         self.customer_id = customer_id
         self.session_id = f"order_{user_id}_{customer_id}"
         self.step = 0 
-        self.data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
+        self.data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0, "summary_shown": False}
 
     def save_order(self, product_total: float, delivery_charge: float) -> bool:
         try:
@@ -183,7 +242,7 @@ def get_session_from_db(session_id: str) -> Optional[OrderSession]:
             row = res.data[0]
             session = OrderSession(row['user_id'], row['customer_id'])
             session.step = row['step']
-            default_data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
+            default_data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0, "summary_shown": False}
             default_data.update(row['data']) 
             session.data = default_data
             return session
@@ -210,24 +269,20 @@ def delete_session_from_db(session_id: str):
     except Exception as e:
         logger.error(f"Error deleting session: {e}")
 
-# ================= OPTIMIZED HELPERS =================
+# ================= HELPERS (IMAGE & MSG) =================
 def get_page_client(page_id):
     res = supabase.table("facebook_integrations").select("*").eq("page_id", str(page_id)).eq("is_connected", True).execute()
     return res.data[0] if res.data else None
 
-def send_message_async(token, user_id, text):
+def send_message(token, user_id, text):
     if not text: return
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
-    
-    def send():
-        try:
-            requests.post(url, json={"recipient": {"id": user_id}, "message": {"text": text}}, timeout=3)
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-    
-    thread_pool.submit(send)
+    try:
+        requests.post(url, json={"recipient": {"id": user_id}, "message": {"text": text}})
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
 
-def send_image_async(token, user_id, image_url):
+def send_image(token, user_id, image_url):
     if not image_url: return
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
     payload = {
@@ -239,133 +294,122 @@ def send_image_async(token, user_id, image_url):
             }
         }
     }
-    
-    def send():
-        try:
-            requests.post(url, json=payload, timeout=5)
-        except Exception as e:
-            logger.error(f"Failed to send image: {e}")
-    
-    thread_pool.submit(send)
-
-# ================= CACHED DATA FETCHERS =================
-@lru_cache(maxsize=100)
-def get_cached_faqs(user_id: str):
     try:
-        res = supabase.table("faqs").select("question, answer").eq("user_id", user_id).execute()
-        return res.data or []
+        requests.post(url, json=payload)
     except Exception as e:
-        logger.error(f"Error fetching FAQs: {e}")
-        return []
+        logger.error(f"Failed to send image: {e}")
+
+# ================= SENDER ACTION HELPER (NEW) =================
+def send_sender_action(token, user_id, action):
+    """
+    Sends sender actions like 'mark_seen' or 'typing_on'
+    """
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
+    payload = {
+        "recipient": {"id": user_id},
+        "sender_action": action
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        logger.error(f"Failed to send sender action {action}: {e}")
+
+# ================= DATA FETCHERS =================
+def get_products_with_details(user_id: str):
+    # Read stock from 'stock' column (not 'quantity')
+    res = supabase.table("products").select("*").eq("user_id", user_id).execute()
+    return res.data or []
 
 def get_faqs(user_id: str):
-    return get_cached_faqs(user_id)
-
-@lru_cache(maxsize=100)
-def get_cached_business_settings(user_id: str) -> Optional[Dict]:
-    try:
-        res = supabase.table("business_settings").select("*").eq("user_id", user_id).limit(1).execute()
-        return res.data[0] if res.data else None
-    except Exception as e:
-        logger.error(f"Error fetching business settings: {e}")
-        return None
+    res = supabase.table("faqs").select("question, answer").eq("user_id", user_id).execute()
+    return res.data or []
 
 def get_business_settings(user_id: str) -> Optional[Dict]:
-    return get_cached_business_settings(user_id)
+    res = supabase.table("business_settings").select("*").eq("user_id", user_id).limit(1).execute()
+    return res.data[0] if res.data else None
 
 def get_chat_memory(user_id: str, customer_id: str, limit: int = 10) -> List[Dict]:
-    try:
-        res = supabase.table("chat_history").select("messages").eq("user_id", user_id).eq("customer_id", customer_id).limit(1).execute()
-        return res.data[0].get("messages", [])[-limit:] if res.data else []
-    except Exception as e:
-        logger.error(f"Error fetching chat memory: {e}")
-        return []
+    res = supabase.table("chat_history").select("messages").eq("user_id", user_id).eq("customer_id", customer_id).limit(1).execute()
+    return res.data[0].get("messages", [])[-limit:] if res.data else []
 
 def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
     now = datetime.now(timezone.utc).isoformat()
-    
-    def save():
-        try:
-            existing = supabase.table("chat_history").select("id").eq("user_id", user_id).eq("customer_id", customer_id).execute()
-            if existing.data:
-                supabase.table("chat_history").update({"messages": messages, "last_updated": now}).eq("id", existing.data[0]["id"]).execute()
-            else:
-                supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
-        except Exception as e:
-            logger.error(f"Error saving chat memory: {e}")
-    
-    thread_pool.submit(save)
+    existing = supabase.table("chat_history").select("id").eq("user_id", user_id).eq("customer_id", customer_id).execute()
+    if existing.data:
+        supabase.table("chat_history").update({"messages": messages, "last_updated": now}).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("chat_history").insert({"user_id": user_id, "customer_id": customer_id, "messages": messages, "created_at": now, "last_updated": now}).execute()
 
-# ================= PRODUCT QUANTITY UPDATER =================
-def update_product_quantity(user_id: str, product_name: str, quantity_sold: int) -> bool:
-    """Update product quantity in database after order confirmation"""
+# ================= PRODUCT STOCK UPDATER =================
+def update_product_stock(user_id: str, product_name: str, quantity_sold: int) -> bool:
+    """Update product stock in database after order confirmation"""
     try:
-        logger.info(f"Updating quantity for product '{product_name}' for user {user_id}, quantity: {quantity_sold}")
+        logger.info(f"Updating stock for product '{product_name}' for user {user_id}, quantity: {quantity_sold}")
         
-        # Get products from cache
-        products = get_cached_products(user_id)
+        # First, get all products for the user
+        res = supabase.table("products")\
+            .select("id, stock, name, in_stock")\
+            .eq("user_id", user_id)\
+            .execute()
         
-        if not products:
+        if not res.data:
             logger.warning(f"No products found for user {user_id}")
             return False
         
         # Use the improved matching function
-        matched_product = find_best_product_match(product_name, products)
+        matched_product = find_best_product_match(product_name, res.data)
         
         if not matched_product:
-            logger.warning(f"Product '{product_name}' not found in database.")
+            logger.warning(f"Product '{product_name}' not found in database. Available products: {[p.get('name') for p in res.data]}")
             return False
         
         product_id = matched_product["id"]
-        current_quantity = matched_product.get("quantity", 0)
+        current_stock = matched_product.get("stock", 0)  # Use 'stock' column
         matched_product_name = matched_product.get("name", "")
         in_stock = matched_product.get("in_stock", True)
         
-        logger.info(f"Found product: '{matched_product_name}', Current quantity: {current_quantity}, In stock: {in_stock}, Requested: {quantity_sold}")
+        logger.info(f"Found product: '{matched_product_name}', Current stock: {current_stock}, In stock: {in_stock}, Requested: {quantity_sold}")
         
-        # CRITICAL FIX: Check both quantity AND in_stock status
+        # CRITICAL FIX: Check both stock AND in_stock status
         if not in_stock:
             logger.error(f"Product '{matched_product_name}' is marked as out of stock (in_stock: {in_stock})")
             return False
         
         # Check if enough stock is available
-        if current_quantity < quantity_sold:
-            logger.error(f"Insufficient stock for product '{matched_product_name}': {current_quantity} available, {quantity_sold} requested")
+        if current_stock < quantity_sold:
+            logger.error(f"Insufficient stock for product '{matched_product_name}': {current_stock} available, {quantity_sold} requested")
             return False
         
-        # Calculate new quantity
-        new_quantity = max(0, current_quantity - quantity_sold)
+        # Calculate new stock
+        new_stock = max(0, current_stock - quantity_sold)
         
-        # Update quantity AND in_stock status if quantity becomes 0
-        update_data = {"quantity": new_quantity}
-        if new_quantity == 0:
+        # Update stock in database
+        update_data = {"stock": new_stock}
+        if new_stock == 0:
             update_data["in_stock"] = False
         
-        # Update quantity in database
+        # Update stock in database
         update_res = supabase.table("products")\
             .update(update_data)\
             .eq("id", product_id)\
             .execute()
         
         if update_res.data:
-            logger.info(f"Successfully updated quantity for product '{matched_product_name}' (ID: {product_id}): {current_quantity} -> {new_quantity}")
-            # Clear cache for this user's products
-            get_cached_products.cache_clear()
+            logger.info(f"Successfully updated stock for product '{matched_product_name}' (ID: {product_id}): {current_stock} -> {new_stock}")
             return True
         else:
-            logger.error(f"Failed to update quantity for product ID {product_id}")
+            logger.error(f"Failed to update stock for product ID {product_id}")
             return False
             
     except Exception as e:
-        logger.error(f"Error updating product quantity: {str(e)}", exc_info=True)
+        logger.error(f"Error updating product stock: {str(e)}", exc_info=True)
     return False
 
-# ================= FULL AI LOGIC (YOUR ORIGINAL STYLE) =================
-def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
-    # Get data from cache
-    business = get_cached_business_settings(user_id)
-    products = get_cached_products(user_id)
-    faqs = get_cached_faqs(user_id)
+# ================= AI LOGIC WITH FIXED API KEY ROTATION =================
+def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=3):
+    business = get_business_settings(user_id)
+    products = get_products_with_details(user_id)
+    faqs = get_faqs(user_id)
     
     biz_phone = business.get('contact_number', '') if business else ""
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
@@ -380,15 +424,30 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     categories = sorted(list(set([p.get('category') for p in products if p.get('category')])))
     category_list_str = ", ".join(categories) if categories else "তথ্য নেই"
 
-    # Product list with EXACT names as in database
-    product_list_short = "\n".join([f"- {p.get('name')}: ৳{p.get('price')} (Category: {p.get('category', 'N/A')})" for p in products if p.get("in_stock")])
-    product_details_full = "\n".join([f"পণ্য: {p.get('name')}\nদাম: ৳{p.get('price')}\nক্যাটাগরি: {p.get('category')}\nবিবরণ: {p.get('description')}" for p in products if p.get("in_stock")])
+    # Get current stock information from 'stock' column
+    product_list_with_stock = []
+    for p in products:
+        stock = p.get("stock", 0)  # Use 'stock' column
+        in_stock_status = p.get("in_stock", True)
+        if in_stock_status and stock > 0:
+            product_list_with_stock.append(f"- {p.get('name')}: ৳{p.get('price')} (স্টক: {stock})")
+    
+    product_list_short = "\n".join(product_list_with_stock)
+    
+    # Full product details including stock
+    product_details_full = []
+    for p in products:
+        stock = p.get("stock", 0)  # Use 'stock' column
+        in_stock_status = p.get("in_stock", True)
+        if in_stock_status and stock > 0:
+            product_details_full.append(f"পণ্য: {p.get('name')}\nদাম: ৳{p.get('price')}\nস্টক: {stock}\nবিবরণ: {p.get('description')}")
+    
+    product_details_full_str = "\n".join(product_details_full)
     
     faq_text = "\n".join([f"Q: {f['question']} | A: {f['answer']}" for f in faqs])
 
     known_info_str = f"প্রাপ্ত তথ্য - নাম: {current_session_data.get('name', 'নেই')}, ফোন: {current_session_data.get('phone', 'নেই')}, ঠিকানা: {current_session_data.get('address', 'নেই')}."
 
-    # YOUR EXACT ORIGINAL SYSTEM PROMPT
     system_prompt = ( f"""
 তুমি '{business_name}'-এর একজন বাস্তব মানুষ, তোমার নাম সিমান্ত। তুমি অত্যন্ত নম্র এবং বন্ধুসুলভ সেলস এক্সপার্ট।
 
@@ -411,14 +470,13 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 - গ্রাহক কোনো একটা পণ্যের কোন নির্দিষ্ট তথ্য জানতে চাইলে, ডাটাবেস দেখে নির্দিষ্ট তথ্যটি নিজের ভাষায় সুন্দর করে বলবে
 
 **স্টক সম্পর্কে কঠোর নিয়ম (NEW - VERY IMPORTANT):**
-- যখন কোনো পণ্যের stock 0 (শূন্য) থাকে, তখন সেই পণ্যটি গ্রাহককে দেখাবে না।
-- যদি ডাটাবেসে কোনো পণ্যের quantity 0 থাকে, তুমি সেটি recommend করবে না, suggest করবে না, বা mention করবে না।
-- শুধুমাত্র 'in_stock' status True আছে এবং quantity > 0 আছে এমন পণ্যই গ্রাহককে দেখাবে।
+- যখন কোনো পণ্যের stock 0 থাকে, তখন সেই পণ্যটি গ্রাহককে দেখাবে না।
+- যদি ডাটাবেসে কোনো পণ্যের stock 0 থাকে, তুমি সেটি recommend করবে না, suggest করবে না, বা mention করবে না।
+- শুধুমাত্র stock > 0 আছে এমন পণ্যই গ্রাহককে দেখাবে।
 - যদি কোনো পণ্য out of stock হয়, তুমি বলবে: "দুঃখিত, এই পণ্যটি এখন স্টক নেই।"
 
 পণ্য সংক্রান্ত নিয়ম (EXTREMELY STRICT - কঠোরভাবে মেনে চলতে হবে):
-1. **পণ্যের নাম সম্পর্কে ABSOLUTE RULE (সবচেয়ে গুরুত্বপূর্ণ নিয়ম):** 
-   - তুমি পণ্যের নাম কখনোই অনুবাদ করবে না, পরিবর্তন করবে না, বা বাংলায় বলবে না।
+1. **পণ্যের নাম সম্পর্কে ABSOLUTE RULE (সবচেয়ে গুরুত্বপূর্ণ নিয়ম):** - তুমি পণ্যের নাম কখনোই অনুবাদ করবে না, পরিবর্তন করবে না, বা বাংলায় বলবে না।
    - পণ্যের নাম ডাটাবেসে যেভাবে আছে (English/Bangla/Mixed) ঠিক সেভাবেই বলবে।
    - উদাহরণ: ডাটাবেসে "iPhone 15 Pro" থাকলে তুমি "আইফোন ১৫ প্রো" বলবে না, "iPhone 15 Pro" বলবে।
    - উদাহরণ: ডাটাবেসে "আলুর চিপস" থাকলে তুমি "Potato Chips" বলবে না, "আলুর চিপস" বলবে।
@@ -440,9 +498,22 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 - যদি নাম বা ফোন নম্বর না থাকে, তবে সুন্দর করে সেটি চাও। অর্ডার সামারি দেখাবে না।
 - শুধুমাত্র নাম, ফোন এবং ঠিকানা পাওয়ার পরেই তুমি অর্ডার সামারি দেখাবে এবং গ্রাহককে কনফার্ম করতে বলবে।
 - তুমি নিজে কখনো বলবে না যে অর্ডার কনফার্ম হয়েছে বা সফল হয়েছে। তুমি শুধু গ্রাহককে তথ্য দিয়ে সাহায্য করবে এবং সব তথ্য পেলে বলবে যে অর্ডারটি কনফার্ম করতে 'Confirm' লিখতে।
-- **গুরুত্বপূর্ণ নিয়ম: ব্যবসার তথ্য (business details) কখনোই গ্রাহকের তথ্য (customer details) হিসাবে নিবে না।** 
-  - যদি গ্রাহক ব্যবসার নাম/ঠিকানা/নম্বর জিজ্ঞেস করে, তুমি সেটা উত্তর দিবে কিন্তু সেটাকে গ্রাহকের নিজের তথ্য হিসাবে গণ্য করবে না।
+- **গুরুত্বপূর্ণ নিয়ম: ব্যবসার তথ্য (business details) কখনোই গ্রাহকের তথ্য (customer details) হিসাবে নিবে না।** - যদি গ্রাহক ব্যবসার নাম/ঠিকানা/নম্বর জিজ্ঞেস করে, তুমি সেটা উত্তর দিবে কিন্তু সেটাকে গ্রাহকের নিজের তথ্য হিসাবে গণ্য করবে না।
   - শুধুমাত্র যখন গ্রাহক সরাসরি বলে "আমার নাম X", "আমার ফোন Y", "আমার ঠিকানা Z" - তখনই সেটাকে গ্রাহকের তথ্য হিসাবে নিবে।
+
+**CRITICAL RULES FOR ORDER CONFIRMATION (MUST FOLLOW):**
+1. তুমি কখনোই গ্রাহককে "Confirm" বলবে না।
+2. তুমি কখনোই "অর্ডার কনফার্ম হয়েছে" বা "সফল হয়েছে" বলবে না।
+3. যদি গ্রাহক "confirm" বলে বা কনফার্ম করতে চায়:
+   - যদি সব তথ্য (নাম, ফোন, ঠিকানা, পণ্য) না থাকে: "দুঃখিত, আপনার [অমুক] তথ্য এখনো পাওয়া যায়নি।"
+   - যদি সব তথ্য থাকে: "সব তথ্য পাওয়া গেছে। অর্ডার সামারি দেখানো হচ্ছে..."
+4. শুধুমাত্র SYSTEM (তুমি নও) অর্ডার কনফার্ম করতে পারবে।
+5. তুমি শুধু তথ্য সংগ্রহ করবে, কখনোই অর্ডার সামারি তৈরি করবে না।
+
+**নতুন অর্ডার শুরু করার নিয়ম (IMPORTANT):**
+- যদি গ্রাহক একটি অর্ডার কনফার্ম করে এবং তারপর আবার কথা শুরু করে, তুমি নতুন করে স্বাগতম জানাবে এবং নতুন অর্ডার নেওয়ার প্রক্রিয়া শুরু করবে।
+- কনফার্ম হওয়া অর্ডারের জন্য ধন্যবাদ জানাবে এবং জিজ্ঞেস করবে নতুন কিছু প্রয়োজন কিনা।
+- গ্রাহক নতুন অর্ডার দিতে চাইলে পুরো প্রক্রিয়া আবার শুরু করবে।
 
 তোমার জন্য কঠোর নিয়মাবলী:
 ১. শুধুমাত্র বাংলা ভাষা: তুমি গ্রাহকের সাথে সর্বদা এবং বাধ্যতামূলকভাবে বাংলায় কথা বলবে। কোনো ইংরেজি বাক্য বা মিশ্র ভাষা ব্যবহার করবে না কিন্তু পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে। নামের অনুবাদ করবে না।
@@ -464,7 +535,7 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 জানা তথ্য: {known_info_str}
 উপলব্ধ ক্যাটাগরি: {category_list_str}
 পণ্য তালিকা: {product_list_short}
-পণ্যের বিস্তারিত (এখান থেকে গুণগান করবে): {product_details_full}
+পণ্যের বিস্তারিত (এখান থেকে গুণগান করবে): {product_details_full_str}
 FAQ: {faq_text}
 
 সব উত্তর ২–৪ লাইনের মধ্যে রাখবে।
@@ -473,25 +544,20 @@ FAQ: {faq_text}
 
     memory = get_chat_memory(user_id, customer_id)
     
-    # Get API keys
-    try:
-        api_key_res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
-        if not api_key_res.data:
-            logger.error(f"No API keys found for user {user_id}")
-            return None, None
-        
-        row = api_key_res.data[0]
-        keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
-        valid_keys = [k for k in keys if k and k.strip()]
-    except Exception as e:
-        logger.error(f"Error fetching API keys: {e}")
-        return None, None
-
+    # Get API keys with rotation
+    valid_keys = get_rotated_api_keys(user_id)
+    
     if not valid_keys:
+        logger.error(f"No API keys found for user {user_id}")
         return None, None
 
-    for key in valid_keys:
-        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
+    # Try each key with intelligent rotation
+    for attempt in range(max_retries):
+        api_key = get_next_api_key(user_id)
+        if not api_key:
+            continue
+            
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
         try:
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -522,69 +588,95 @@ FAQ: {faq_text}
                     matched_image = product.get('image_url')
             
             return reply, matched_image
+            
         except Exception as e:
-            logger.error(f"AI Generation Error: {e}")
-            continue 
+            logger.error(f"AI Generation Error with key {api_key[:20]}...: {e}")
+            # Mark this key as having an error
+            mark_api_key_error(user_id, api_key)
+            
+            # Check if it's a rate limit error
+            if "rate_limit" in str(e) or "429" in str(e):
+                logger.warning(f"Rate limit hit for key {api_key[:20]}..., trying next key")
+                # Small delay before trying next key
+                time.sleep(1)
+                continue
+            else:
+                # Other error, try next key
+                continue
     
+    logger.error(f"All API keys failed for user {user_id} after {max_retries} attempts")
     return None, None
 
-# ================= ORDER EXTRACTION (DYNAMIC SAAS VERSION) =================
-def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_retries=2):
-    try:
-        api_key_res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
-        if not api_key_res.data: return None
-        
-        row = api_key_res.data[0]
-        keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
-        valid_keys = [k for k in keys if k and k.strip()]
+# ================= ORDER EXTRACTION WITH API ROTATION =================
+def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_retries=3):
+    # Get API keys with rotation
+    valid_keys = get_rotated_api_keys(user_id)
+    
+    if not valid_keys: 
+        return None
 
-        if not valid_keys: return None
+    # --- DYNAMIC PROMPT FOR SAAS (NO HARDCODING) ---
+    prompt = (
+        "Extract order details from the conversation into JSON. "
+        "Keys: name, phone, address, items (product_name, quantity), delivery_charge (number or null). "
+        f"CONTEXT (Strictly use this policy): '{delivery_policy_text}'. "
+        "IMPORTANT RULES: "
+        "1. Extract ONLY customer details, NOT business details. "
+        "2. If customer asks about business address/phone, DO NOT treat it as customer address/phone. "
+        "3. Extract customer name ONLY if explicitly stated by customer (e.g., 'আমার নাম X', 'নাম X', 'I am X'). "
+        "4. Extract customer phone ONLY if explicitly stated by customer (e.g., 'আমার ফোন X', 'ফোন X', 'মোবাইল X'). "
+        "5. Extract customer address ONLY if explicitly stated by customer (e.g., 'আমার ঠিকানা X', 'ঠিকানা X', 'পাঠাবো X'). "
+        "6. Identify the delivery charge BY COMPARING the user's address with the provided 'CONTEXT'. "
+        "7. Do NOT use any pre-set values. Only use values found in the CONTEXT. "
+        "8. If the user's address matches a location in the policy, extract the specific numeric charge. "
+        "9. If you cannot find a match or the address is missing, set delivery_charge to null. "
+        "10. Return ONLY a valid JSON object."
+    )
 
-        # --- DYNAMIC PROMPT FOR SAAS (NO HARDCODING) ---
-        prompt = (
-            "Extract order details from the conversation into JSON. "
-            "Keys: name, phone, address, items (product_name, quantity), delivery_charge (number or null). "
-            f"CONTEXT (Strictly use this policy): '{delivery_policy_text}'. "
-            "IMPORTANT RULES: "
-            "1. Extract ONLY customer details, NOT business details. "
-            "2. If customer asks about business address/phone, DO NOT treat it as customer address/phone. "
-            "3. Extract customer name ONLY if explicitly stated by customer (e.g., 'আমার নাম X', 'নাম X', 'I am X'). "
-            "4. Extract customer phone ONLY if explicitly stated by customer (e.g., 'আমার ফোন X', 'ফোন X', 'মোবাইল X'). "
-            "5. Extract customer address ONLY if explicitly stated by customer (e.g., 'আমার ঠিকানা X', 'ঠিকানা X', 'পাঠাবো X'). "
-            "6. Identify the delivery charge BY COMPARING the user's address with the provided 'CONTEXT'. "
-            "7. Do NOT use any pre-set values. Only use values found in the CONTEXT. "
-            "8. If the user's address matches a location in the policy, extract the specific numeric charge. "
-            "9. If you cannot find a match or the address is missing, set delivery_charge to null. "
-            "10. Return ONLY a valid JSON object."
-        )
-
-        for key in valid_keys:
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
-            try:
-                res = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": prompt}] + messages[-8:], 
-                    response_format={"type": "json_object"},
-                    temperature=0,
-                    timeout=4.0
-                )
-                content = res.choices[0].message.content
-                cleaned_content = re.sub(r"```json|```", "", content).strip()
-                extracted_json = json.loads(cleaned_content)
-                
-                # Ensure delivery_charge is returned as a number (0 if null)
-                if 'delivery_charge' in extracted_json:
-                    try:
-                        extracted_json['delivery_charge'] = float(extracted_json['delivery_charge'])
-                    except (TypeError, ValueError):
-                        extracted_json['delivery_charge'] = 0.0  # Default to 0 instead of None
-                        
-                return extracted_json
-            except Exception as e:
-                logger.error(f"Extraction Error: {e}")
+    # Try each key with intelligent rotation
+    for attempt in range(max_retries):
+        api_key = get_next_api_key(user_id)
+        if not api_key:
+            continue
+            
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
+        try:
+            res = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": prompt}] + messages[-8:], 
+                response_format={"type": "json_object"},
+                temperature=0,
+                timeout=4.0
+            )
+            content = res.choices[0].message.content
+            cleaned_content = re.sub(r"```json|```", "", content).strip()
+            extracted_json = json.loads(cleaned_content)
+            
+            # Ensure delivery_charge is returned as a number (0 if null)
+            if 'delivery_charge' in extracted_json:
+                try:
+                    extracted_json['delivery_charge'] = float(extracted_json['delivery_charge'])
+                except (TypeError, ValueError):
+                    extracted_json['delivery_charge'] = 0.0  # Default to 0 instead of None
+                    
+            return extracted_json
+            
+        except Exception as e:
+            logger.error(f"Extraction Error with key {api_key[:20]}...: {e}")
+            # Mark this key as having an error
+            mark_api_key_error(user_id, api_key)
+            
+            # Check if it's a rate limit error
+            if "rate_limit" in str(e) or "429" in str(e):
+                logger.warning(f"Rate limit hit for extraction key {api_key[:20]}..., trying next key")
+                # Small delay before trying next key
+                time.sleep(1)
                 continue
-    except Exception as e:
-        logger.error(f"Error in order extraction: {e}")
+            else:
+                # Other error, try next key
+                continue
+    
+    logger.error(f"All API keys failed for extraction for user {user_id} after {max_retries} attempts")
     return None
 
 # ================= IMPROVED PRODUCT MATCHING =================
@@ -638,17 +730,26 @@ def detect_order_confirmation_intent(text: str, session_data: Dict) -> Tuple[boo
     """
     text_lower = text.lower().strip()
     
-    # Confirmation patterns - ALL positive confirmations
+    # Relaxed patterns to ensure "okay confirm", "hae confirm", etc. are caught
     confirm_patterns = [
-        r'^(confirm|conform|Hae confirm koren|Okay confirm koren|confirm kore den)$',
-        r'^(yes|yep|yeah|ha|haa|haan|হ্যা|হ্যাঁ|হা|হাঃ|হে)$',
-        r'^(ঠিক আছে|ঠিক|ঠিকহ|okay|ok|okay confirm)$',
-        r'^(order confirm|অর্ডার কনফার্ম|অর্ডার কনফার্ম কর)$',
-        r'^(done|দাও|নিশ্চিত কর)$',
-        r'^(পাঠাও|পাঠান|send)$',
-        r'^(চলুক|চলবে|go ahead)$',
-        r'^(agreed|agree|এগ্রি)$',
-        r'^(\+1|\👍|\✅|\✔️|\😊)$'  # Positive emojis
+        r'confirm',  # Matches "confirm" anywhere in the text
+        r'কনফার্ম',
+        r'ঠিক আছে',
+        r'ok',
+        r'okay',
+        r'hae',
+        r'ji',
+        r'হ্যা',
+        r'জি',
+        r'yes',
+        r'done',
+        r'agreed',
+        r'নিশ্চিত',
+        r'পাঠান',
+        r'send',
+        r'\+1',
+        r'\👍',
+        r'\✅'
     ]
     
     # Delay patterns - Customer wants to confirm later
@@ -697,323 +798,57 @@ def detect_order_confirmation_intent(text: str, session_data: Dict) -> Tuple[boo
     
     return False, 'neutral'
 
-# ================= OPTIMIZED WEBHOOK HANDLER =================
-def process_message_batch(msg_event: Dict, page: Dict):
-    """Process single message efficiently"""
-    try:
-        sender = msg_event["sender"]["id"]
-        raw_text = msg_event["message"].get("text", "")
-        user_id = page["user_id"]
-        token = page["page_access_token"]
-        page_id = page["page_id"]
+# ================= ORDER SUMMARY DISPLAY =================
+def show_order_summary(token, customer_id, session_data, business_name):
+    """
+    Show order summary when all information is complete
+    This runs INSTEAD of AI reply
+    """
+    items = session_data.get('items', [])
+    delivery_charge = session_data.get('delivery_charge', 0)
+    
+    # Get products to calculate price
+    user_id = session_data.get('user_id_from_session', '')
+    products_db = get_products_with_details(user_id) if user_id else []
+    
+    summary_lines = []
+    items_total = 0
+    
+    for item in items:
+        product_name = item.get('product_name', '')
+        quantity = item.get('quantity', 1)
         
-        if not raw_text:
-            return
-        
-        # Check subscription
-        if not check_subscription_status(user_id):
-            logger.info(f"Subscription inactive for user {user_id}")
-            return
-        
-        # Get bot settings
-        bot_settings = get_bot_settings(user_id)
-        if not bot_settings.get("ai_reply_enabled", True):
-            return
-        
-        # Typing delay
-        delay_ms = bot_settings.get("typing_delay", 0)
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000)
-        
-        # Session management
-        session_id = f"order_{user_id}_{sender}"
-        current_session = get_session_from_db(session_id)
-        if not current_session:
-            current_session = OrderSession(user_id, sender)
-        
-        # Update page_id for follow-up
-        try:
-            supabase.table("order_sessions")\
-                .update({"page_id": page_id})\
-                .eq("id", session_id)\
-                .execute()
-        except Exception:
-            pass
-        
-        # Get memory
-        memory = get_chat_memory(user_id, sender)
-        
-        # Welcome message for new conversations
-        welcome_msg = bot_settings.get("welcome_message")
-        if not memory and welcome_msg:
-            send_message_async(token, sender, welcome_msg)
-            save_chat_memory(user_id, sender, [{"role": "assistant", "content": welcome_msg}])
-        
-        # Order extraction
-        temp_memory = memory + [{"role": "user", "content": raw_text}]
-        business = get_cached_business_settings(user_id)
-        delivery_policy = business.get('delivery_info', "তথ্য নেই") if business else "তথ্য নেই"
-        
-        extracted = extract_order_data_with_retry(user_id, temp_memory, delivery_policy)
-        
-        if extracted:
-            # --- FIXED: NOTIFY USER ABOUT DELIVERY CHARGE IMMEDIATELY ---
-            had_address = bool(current_session.data.get("address"))
-            
-            # Only update if extracted data is NOT business details
-            business_address = business.get('address', '') if business else ''
-            business_phone = business.get('contact_number', '') if business else ''
-            
-            # Check if extracted address is actually business address
-            if extracted.get("address") and business_address:
-                if business_address.lower() in extracted.get("address", "").lower():
-                    logger.info(f"Ignoring business address as customer address: {extracted.get('address')}")
-                else:
-                    if extracted.get("address"): 
-                        current_session.data["address"] = extracted["address"]
-            
-            # Check if extracted phone is actually business phone
-            if extracted.get("phone") and business_phone:
-                if business_phone in extracted.get("phone", ""):
-                    logger.info(f"Ignoring business phone as customer phone: {extracted.get('phone')}")
-                else:
-                    if extracted.get("phone"): 
-                        current_session.data["phone"] = extracted["phone"]
-            
-            # For name, always update if extracted
-            if extracted.get("name"): 
-                current_session.data["name"] = extracted["name"]
-            
-            if extracted.get("items"): 
-                current_session.data["items"] = extracted["items"]
-            
-            if "delivery_charge" in extracted and isinstance(extracted["delivery_charge"], (int, float)):
-                 current_session.data["delivery_charge"] = extracted["delivery_charge"]
-                 # Send notification only if address was just now extracted/updated
-                 if not had_address and extracted.get("address"):
-                     send_message_async(token, sender, f"আপনার ঠিকানায় ডেলিভারি চার্জ ৳{extracted['delivery_charge']}")
-            
-            # Reset follow-up status when customer speaks
-            try:
-                supabase.table("order_sessions").update({"last_followup_sent": None}).eq("id", session_id).execute()
-            except Exception:
-                pass
-            
-            save_session_to_db(current_session)
+        # Find product to get price
+        product = find_best_product_match(product_name, products_db)
+        if product:
+            price = product.get('price', 0)
+            subtotal = price * quantity
+            items_total += subtotal
+            summary_lines.append(f"• {product_name} x{quantity} = ৳{subtotal}")
+        else:
+            summary_lines.append(f"• {product_name} x{quantity}")
+    
+    # Calculate total
+    total_amount = items_total + delivery_charge
+    
+    summary_message = (
+        f"📋 **অর্ডার সামারি** 📋\n\n"
+        f"পণ্য:\n" + "\n".join(summary_lines) + f"\n\n"
+        f"পণ্যের মূল্য: ৳{items_total}\n"
+        f"ডেলিভারি চার্জ: ৳{delivery_charge}\n"
+        f"**মোট টাকা: ৳{total_amount}**\n\n"
+        f"গ্রাহক তথ্য:\n"
+        f"• নাম: {session_data.get('name', 'নেই')}\n"
+        f"• ফোন: {session_data.get('phone', 'নেই')}\n"
+        f"• ঠিকানা: {session_data.get('address', 'নেই')}\n\n"
+        f"অর্ডারটি কনফার্ম করতে 'Confirm' লিখুন।\n"
+        f"কোনো পরিবর্তন করতে চাইলে বলুন।"
+    )
+    
+    send_message(token, customer_id, summary_message)
+    return summary_message
 
-        s_data = current_session.data
-        has_all_info = all([s_data.get("name"), s_data.get("phone"), s_data.get("address"), s_data.get("items")])
-        
-        # SMART ORDER CONFIRMATION DETECTION
-        is_confirmation, intent_type = detect_order_confirmation_intent(raw_text, s_data)
-        
-        # Handle cancellation
-        text_lower = raw_text.lower()
-        if "cancel" in text_lower or "বাতিল" in text_lower:
-            delete_session_from_db(session_id)
-            send_message_async(token, sender, "অর্ডার সেশনটি বাতিল করা হয়েছে।")
-            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": "অর্ডার সেশনটি বাতিল করা হয়েছে।"}])
-            return
-        
-        # Handle confirmation intent
-        if is_confirmation:
-            if has_all_info:
-                products_db = get_cached_products(user_id)
-                final_delivery_charge = float(s_data.get("delivery_charge", 0))
-                
-                items_total = 0
-                summary_list = []
-                order_success = True
-                insufficient_stock_products = []
-                out_of_stock_products = []
-                
-                # FIRST: Check stock for ALL items BEFORE processing
-                for item in s_data.get('items', []):
-                    product_name = item.get('product_name')
-                    qty = int(item.get('quantity', 1))
-                    
-                    if not product_name:
-                        order_success = False
-                        continue
-                    
-                    matched_product = find_best_product_match(product_name, products_db)
-                    
-                    if matched_product:
-                        current_stock = matched_product.get('quantity', 0)
-                        in_stock_status = matched_product.get('in_stock', True)
-                        
-                        # Check both conditions
-                        if not in_stock_status:
-                            order_success = False
-                            out_of_stock_products.append(f"{matched_product['name']} (স্টক নেই)")
-                        elif current_stock < qty:
-                            order_success = False
-                            insufficient_stock_products.append(f"{matched_product['name']} (স্টক: {current_stock}, চাহিদা: {qty})")
-                    else:
-                        order_success = False
-                        send_message_async(token, sender, f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।")
-                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।"}])
-                
-                # Send appropriate error messages
-                if out_of_stock_products:
-                    stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products)
-                    send_message_async(token, sender, stock_msg)
-                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
-                    return
-                
-                if insufficient_stock_products:
-                    stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products)
-                    send_message_async(token, sender, stock_msg)
-                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
-                    return
-                
-                # If stock check passed, calculate total and process order
-                if order_success:
-                    for item in s_data.get('items', []):
-                        product_name = item.get('product_name')
-                        qty = int(item.get('quantity', 1))
-                        
-                        matched_product = find_best_product_match(product_name, products_db)
-                        if matched_product:
-                            items_total += matched_product['price'] * qty
-                            summary_list.append(f"{matched_product['name']} x{qty}")
-                            current_session.data['product'] = matched_product['name']
-                    
-                    if items_total > 0:
-                        # Update product quantities
-                        all_quantity_updates_successful = True
-                        failed_products = []
-                        
-                        for item in s_data.get('items', []):
-                            product_name = item.get('product_name')
-                            qty = int(item.get('quantity', 1))
-                            if product_name:
-                                quantity_updated = update_product_quantity(user_id, product_name, qty)
-                                if not quantity_updated:
-                                    failed_products.append(product_name)
-                                    all_quantity_updates_successful = False
-                        
-                        if not all_quantity_updates_successful:
-                            error_msg = f"❌ দুঃখিত, নিম্নলিখিত পণ্যগুলোর স্টক আপডেট করতে সমস্যা হয়েছে: {', '.join(failed_products)}"
-                            send_message_async(token, sender, error_msg)
-                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                            return
-                        
-                        # Save order to database
-                        if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
-                            confirm_msg = (
-                                f"✅ আপনার অর্ডারটি গ্রহণ করা হয়েছে,\n\n"
-                                f"অর্ডার সামারি:\n{', '.join(summary_list)}\n"
-                                f"মোট: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জ: ৳{final_delivery_charge})\n\n"
-                                f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো। ধন্যবাদ। ❤️"
-                            )
-                            send_message_async(token, sender, confirm_msg)
-                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": confirm_msg}])
-                            delete_session_from_db(session_id)
-                        else:
-                            logger.error(f"Order Save Failed for customer {sender}")
-                            error_msg = "❌ দুঃখিত, অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।"
-                            send_message_async(token, sender, error_msg)
-                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                    else:
-                        error_msg = "❌ দুঃখিত, কোনো পণ্য সনাক্ত করা যায়নি।"
-                        send_message_async(token, sender, error_msg)
-                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                
-                return
-            else:
-                # Customer said confirm but info is not complete
-                missing = []
-                if not s_data.get("name"): missing.append("নাম")
-                if not s_data.get("phone"): missing.append("ফোন নম্বর")
-                if not s_data.get("address"): missing.append("ঠিকানা")
-                if not s_data.get("items"): missing.append("পণ্য")
-                needed_info = " ও ".join(missing)
-                response_msg = f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।"
-                send_message_async(token, sender, response_msg)
-                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": response_msg}])
-                return
-        
-        # Handle delay intent
-        elif intent_type == 'delay':
-            delay_msg = "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। আমি অপেক্ষায় থাকব। 😊"
-            send_message_async(token, sender, delay_msg)
-            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": delay_msg}])
-            return
-        
-        # Handle denial intent
-        elif intent_type == 'deny':
-            deny_msg = "ঠিক আছে, কোনো সমস্যা নেই। যখনই প্রয়োজন হবে, আমরা আছি। ধন্যবাদ! 😊"
-            send_message_async(token, sender, deny_msg)
-            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": deny_msg}])
-            delete_session_from_db(session_id)
-            return
-
-        # If not a confirmation/delay/denial intent, proceed with AI reply
-        if bot_settings.get("hybrid_mode", True):
-            reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
-            if reply:
-                if product_image:
-                    send_image_async(token, sender, product_image)
-                send_message_async(token, sender, reply)
-
-        elif bot_settings.get("faq_only_mode", False):
-            faqs = get_cached_faqs(user_id)
-            faq_reply = None
-            for f in faqs:
-                if f['question'] and f['question'].lower() in text_lower:
-                    faq_reply = f['answer']
-                    break
-            if faq_reply:
-                send_message_async(token, sender, faq_reply)
-                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": faq_reply}])
-                
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-
-# ================= OPTIMIZED WEBHOOK =================
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    if request.method == "GET":
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        verify_token = os.getenv("VERIFY_TOKEN")
-        
-        if mode == "subscribe" and token == verify_token:
-            logger.info("Webhook verified successfully!")
-            return challenge, 200
-        return "Verification failed", 403
-
-    data = request.get_json()
-    if not data: return jsonify({"status": "error"}), 400
-
-    if data.get("object") == "page":
-        # Clean old processed messages
-        processed_messages.clear_old()
-        
-        for entry in data.get("entry", []):
-            page_id = entry.get("id")
-            page = get_page_client(page_id)
-            if not page: continue
-            user_id, token = page["user_id"], page["page_access_token"]
-
-            for msg_event in entry.get("messaging", []):
-                sender = msg_event["sender"]["id"]
-                if "message" not in msg_event: continue
-                if "text" not in msg_event["message"]: continue
-                
-                msg_id = msg_event["message"].get("mid")
-                if not msg_id: continue
-                if processed_messages.get(msg_id): continue
-                processed_messages.set(msg_id, True)
-
-                # Submit for async processing
-                thread_pool.submit(process_message_batch, msg_event, page)
-
-    return jsonify({"ok": True}), 200
-
-# ================= FOLLOW-UP SYSTEM =================
+# ================= FOLLOW-UP SYSTEM (NEW IMPLEMENTATION) =================
 @app.route("/send-followup", methods=["POST"])
 def send_followup():
     """Background task to send follow-up messages to inactive customers"""
@@ -1033,7 +868,7 @@ def send_followup():
         for session in res.data:
             user_id = session['user_id']
             customer_id = session['customer_id']
-            page_id = session.get('page_id')
+            page_id = session.get('page_id') # Ensure page_id is saved in session during webhook
             
             # Skip if subscription is not active
             if not check_subscription_status(user_id):
@@ -1050,7 +885,7 @@ def send_followup():
                 else:
                     msg = "আপনি আপনার সব তথ্য দিয়েছেন, অর্ডারটি কি আমি কনফার্ম করে দেব? কনফার্ম করতে শুধু 'Confirm' লিখুন।"
                 
-                send_message_async(token, customer_id, msg)
+                send_message(token, customer_id, msg)
                 
                 # Update DB to mark follow-up as sent
                 supabase.table("order_sessions").update({"last_followup_sent": True}).eq("id", session['id']).execute()
@@ -1060,41 +895,401 @@ def send_followup():
         logger.error(f"Follow-up execution error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ================= HEALTH CHECK =================
-@app.route("/health", methods=["GET"])
-def health_check():
-    """Lightweight health check endpoint"""
-    try:
-        # Check database connection
-        supabase.table("subscriptions").select("count", count="exact").limit(1).execute()
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "cache_size": len(processed_messages.cache)
-        }), 200
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+# ================= WEBHOOK =================
 
-# ================= CLEANUP =================
-@app.teardown_appcontext
-def cleanup(exception=None):
-    """Cleanup resources"""
-    thread_pool.shutdown(wait=False)
-    get_cached_subscription_status.cache_clear()
-    get_cached_bot_settings.cache_clear()
-    get_cached_products.cache_clear()
-    get_cached_faqs.cache_clear()
-    get_cached_business_settings.cache_clear()
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    global processed_messages 
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        verify_token = os.getenv("VERIFY_TOKEN")
+        
+        if mode == "subscribe" and token == verify_token:
+            logger.info("Webhook verified successfully!")
+            return challenge, 200
+        return "Verification failed", 403
 
-# ================= MAIN =================
+    data = request.get_json()
+    if not data: return jsonify({"status": "error"}), 400
+
+    if data.get("object") == "page":
+        # Clean old processed messages (once per request, not per message)
+        now_ts = time.time()
+        processed_messages = {k: v for k, v in processed_messages.items() if now_ts - v < 300}
+        
+        for entry in data.get("entry", []):
+            page_id = entry.get("id")
+            page = get_page_client(page_id)
+            if not page: continue
+            user_id, token = page["user_id"], page["page_access_token"]
+
+            for msg_event in entry.get("messaging", []):
+                sender = msg_event["sender"]["id"]
+                if "message" not in msg_event: continue
+                if "text" not in msg_event["message"]: continue
+                
+                msg_id = msg_event["message"].get("mid")
+                if not msg_id: continue
+                if msg_id in processed_messages: continue
+                processed_messages[msg_id] = time.time()
+
+                raw_text = msg_event["message"].get("text", "")
+                if not raw_text: continue
+                text = raw_text.lower().strip()
+                
+                # --- NEW: SEND SEEN & TYPING ACTION ---
+                send_sender_action(token, sender, "mark_seen")
+                send_sender_action(token, sender, "typing_on")
+
+                if not check_subscription_status(user_id):
+                    logger.info(f"Subscription inactive for user {user_id}. Bot silent.")
+                    continue
+
+                bot_settings = get_bot_settings(user_id)
+                if not bot_settings.get("ai_reply_enabled", True):
+                    continue
+                
+                delay_ms = bot_settings.get("typing_delay", 0)
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000)
+
+                memory = get_chat_memory(user_id, sender)
+                welcome_msg = bot_settings.get("welcome_message")
+                
+                # Check if this is a fresh start after order confirmation
+                session_id = f"order_{user_id}_{sender}"
+                current_session = get_session_from_db(session_id)
+                
+                # =========== FIXED: PREVENT AI FROM REPLYING TO CONFIRMATION ===========
+                # Check if this is a confirmation message BEFORE processing
+                if any(word in text for word in ['confirm', 'কনফার্ম', 'ok', 'ঠিক আছে', 'yes', 'হ্যা', 'হ্যাঁ']):
+                    if current_session:
+                        s_data = current_session.data
+                        has_all_info = all([s_data.get("name"), s_data.get("phone"), 
+                                          s_data.get("address"), s_data.get("items")])
+                        
+                        if has_all_info:
+                            # Show order summary immediately (skip AI)
+                            business = get_business_settings(user_id)
+                            business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
+                            s_data['user_id_from_session'] = user_id
+                            
+                            # Mark summary as shown first
+                            s_data["summary_shown"] = True
+                            current_session.data = s_data
+                            save_session_to_db(current_session)
+                            
+                            # Then show summary
+                            summary_message = show_order_summary(token, sender, s_data, business_name)
+                            
+                            # Save to chat memory
+                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, 
+                                                                      {"role": "assistant", "content": summary_message}])
+                            continue  # Skip AI processing
+                
+                # If no session exists, send welcome message
+                if not current_session:
+                    if welcome_msg and not memory:
+                        send_message(token, sender, welcome_msg)
+                        save_chat_memory(user_id, sender, [{"role": "assistant", "content": welcome_msg}])
+                    
+                    current_session = OrderSession(user_id, sender)
+
+                # Update page_id for follow-up purpose
+                try:
+                    supabase.table("order_sessions").update({"page_id": page_id}).eq("id", session_id).execute()
+                except: pass
+
+                temp_memory = memory + [{"role": "user", "content": raw_text}]
+                business = get_business_settings(user_id)
+                delivery_policy = business.get('delivery_info', "তথ্য নেই") if business else "তথ্য নেই"
+                
+                extracted = extract_order_data_with_retry(user_id, temp_memory, delivery_policy)
+                
+                if extracted:
+                    # --- FIXED: NOTIFY USER ABOUT DELIVERY CHARGE IMMEDIATELY ---
+                    had_address = bool(current_session.data.get("address"))
+                    data_changed = False # Track if data actually changes
+                    
+                    # Only update if extracted data is NOT business details
+                    business_address = business.get('address', '') if business else ''
+                    business_phone = business.get('contact_number', '') if business else ''
+                    
+                    # Check if extracted address is actually business address
+                    if extracted.get("address") and business_address:
+                        if business_address.lower() in extracted.get("address", "").lower():
+                            logger.info(f"Ignoring business address as customer address: {extracted.get('address')}")
+                        else:
+                            if extracted.get("address") and extracted.get("address") != current_session.data.get("address"): 
+                                current_session.data["address"] = extracted["address"]
+                                data_changed = True
+                    elif extracted.get("address") and extracted.get("address") != current_session.data.get("address"):
+                         current_session.data["address"] = extracted["address"]
+                         data_changed = True
+                    
+                    # Check if extracted phone is actually business phone
+                    if extracted.get("phone") and business_phone:
+                        if business_phone in extracted.get("phone", ""):
+                            logger.info(f"Ignoring business phone as customer phone: {extracted.get('phone')}")
+                        else:
+                            if extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"): 
+                                current_session.data["phone"] = extracted["phone"]
+                                data_changed = True
+                    elif extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"):
+                        current_session.data["phone"] = extracted["phone"]
+                        data_changed = True
+                    
+                    # For name
+                    if extracted.get("name") and extracted.get("name") != current_session.data.get("name"): 
+                        current_session.data["name"] = extracted["name"]
+                        data_changed = True
+                    
+                    # For items
+                    if extracted.get("items") and extracted.get("items") != current_session.data.get("items"): 
+                        current_session.data["items"] = extracted["items"]
+                        data_changed = True
+                    
+                    if "delivery_charge" in extracted and isinstance(extracted["delivery_charge"], (int, float)):
+                         current_session.data["delivery_charge"] = extracted["delivery_charge"]
+                         # Send notification only if address was just now extracted/updated
+                         if not had_address and extracted.get("address"):
+                             send_message(token, sender, f"আপনার ঠিকানায় ডেলিভারি চার্জ ৳{extracted['delivery_charge']}")
+                    
+                    # Reset follow-up status when customer speaks
+                    try:
+                        supabase.table("order_sessions").update({"last_followup_sent": None}).eq("id", session_id).execute()
+                    except: pass
+                    
+                    # --- FIXED LOGIC: ONLY RESET SUMMARY IF DATA CHANGED ---
+                    # Check if user is confirming - if so, DO NOT reset summary even if data is extracted
+                    is_confirming_now = any(w in text for w in ['confirm', 'ok', 'tik', 'done', 'yes', 'humm', 'ji', 'hae'])
+                    
+                    if data_changed and not is_confirming_now:
+                         current_session.data["summary_shown"] = False
+                    
+                    save_session_to_db(current_session)
+
+                s_data = current_session.data
+                has_all_info = all([s_data.get("name"), s_data.get("phone"), s_data.get("address"), s_data.get("items")])
+                
+                # --- CRITICAL FIX: SHOW ORDER SUMMARY WHEN ALL INFO IS COMPLETE ---
+                if has_all_info and not s_data.get("summary_shown", False):
+                    # Show order summary (SYSTEM reply, not AI)
+                    business = get_business_settings(user_id)
+                    business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
+                    s_data['user_id_from_session'] = user_id  # Add user_id for product lookup
+                    summary_message = show_order_summary(token, sender, s_data, business_name)
+                    
+                    # Mark summary as shown
+                    s_data["summary_shown"] = True
+                    current_session.data = s_data
+                    save_session_to_db(current_session)
+                    
+                    # Save to chat memory
+                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": summary_message}])
+                    continue  # Skip AI processing after showing summary
+                
+                # SMART ORDER CONFIRMATION DETECTION
+                is_confirmation, intent_type = detect_order_confirmation_intent(raw_text, s_data)
+                
+                # Handle cancellation
+                if "cancel" in text or "বাতিল" in text:
+                    delete_session_from_db(session_id)
+                    send_message(token, sender, "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।")
+                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।"}])
+                    continue
+                
+                # Handle confirmation intent
+                if is_confirmation:
+                    if has_all_info:
+                        products_db = get_products_with_details(user_id)
+                        final_delivery_charge = float(s_data.get('delivery_charge', 0))
+                        
+                        items_total = 0
+                        summary_list = []
+                        order_success = True
+                        insufficient_stock_products = []
+                        out_of_stock_products = []
+                        
+                        # FIRST: Check stock for ALL items BEFORE processing
+                        for item in s_data.get('items', []):
+                            product_name = item.get('product_name')
+                            qty = int(item.get('quantity', 1))
+                            
+                            if not product_name:
+                                order_success = False
+                                continue
+                            
+                            matched_product = find_best_product_match(product_name, products_db)
+                            
+                            if matched_product:
+                                current_stock = matched_product.get('stock', 0)  # Use 'stock' column
+                                in_stock_status = matched_product.get('in_stock', True)
+                                
+                                # Check both stock and in_stock status
+                                if not in_stock_status:
+                                    order_success = False
+                                    out_of_stock_products.append(f"{matched_product['name']} (স্টক নেই)")
+                                elif current_stock < qty:
+                                    order_success = False
+                                    insufficient_stock_products.append(f"{matched_product['name']} (স্টক: {current_stock}, চাহিদা: {qty})")
+                            else:
+                                order_success = False
+                                send_message(token, sender, f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।")
+                                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।"}])
+                        
+                        # Send appropriate error messages
+                        if out_of_stock_products:
+                            stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products)
+                            send_message(token, sender, stock_msg)
+                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
+                            continue
+                        
+                        if insufficient_stock_products:
+                            stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products)
+                            send_message(token, sender, stock_msg)
+                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
+                            continue
+                        
+                        # If stock check passed, calculate total and process order
+                        if order_success:
+                            for item in s_data.get('items', []):
+                                product_name = item.get('product_name')
+                                qty = int(item.get('quantity', 1))
+                                
+                                matched_product = find_best_product_match(product_name, products_db)
+                                if matched_product:
+                                    items_total += matched_product['price'] * qty
+                                    summary_list.append(f"{matched_product['name']} x{qty}")
+                                    current_session.data['product'] = matched_product['name']
+                            
+                            if items_total > 0:
+                                # Update product stock
+                                all_stock_updates_successful = True
+                                failed_products = []
+                                
+                                for item in s_data.get('items', []):
+                                    product_name = item.get('product_name')
+                                    qty = int(item.get('quantity', 1))
+                                    if product_name:
+                                        stock_updated = update_product_stock(user_id, product_name, qty)
+                                        if not stock_updated:
+                                            failed_products.append(product_name)
+                                            all_stock_updates_successful = False
+                                
+                                if not all_stock_updates_successful:
+                                    error_msg = f"❌ দুঃখিত, নিম্নলিখিত পণ্যগুলোর স্টক আপডেট করতে সমস্যা হয়েছে: {', '.join(failed_products)}"
+                                    send_message(token, sender, error_msg)
+                                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
+                                    continue
+                                
+                                # Save order to database
+                                if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
+                                    confirm_msg = (
+                                        f"✅ আপনার অর্ডারটি সফলভাবে কনফার্ম হয়েছে!\n\n"
+                                        f"অর্ডার সামারি:\n{', '.join(summary_list)}\n"
+                                        f"মোট: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জ সহ)\n\n"
+                                        f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো।\n\n"
+                                        f"আপনি কি আরেকটি অর্ডার দিতে চান?\n"
+                                        f"হ্যাঁ হলে শুধু বলুন 'হ্যাঁ' বা নতুন পণ্যের নাম বলুন। 😊"
+                                    )
+                                    send_message(token, sender, confirm_msg)
+                                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": confirm_msg}])
+                                    
+                                    # ====================================================================
+                                    # CRITICAL FIXES FOR SESSION AND MEMORY RESET
+                                    # ====================================================================
+                                    
+                                    # 1. Clear chat history for this user so AI forgets the old context
+                                    try:
+                                        supabase.table("chat_history").delete().eq("user_id", user_id).eq("customer_id", sender).execute()
+                                    except Exception as e:
+                                        logger.error(f"Error clearing chat history: {e}")
+
+                                    # 2. Delete the session from DB
+                                    delete_session_from_db(session_id)
+                                    
+                                    # 3. Clear local session object
+                                    current_session = None
+                                    
+                                else:
+                                    logger.error(f"Order Save Failed for customer {sender}")
+                                    error_msg = "❌ দুঃখিত, অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।"
+                                    send_message(token, sender, error_msg)
+                                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
+                            else:
+                                error_msg = "❌ দুঃখিত, কোনো পণ্য সনাক্ত করা যায়নি।"
+                                send_message(token, sender, error_msg)
+                                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
+                        
+                        continue
+                    else:
+                        # Customer said confirm but info is not complete
+                        missing = []
+                        if not s_data.get("name"): missing.append("নাম")
+                        if not s_data.get("phone"): missing.append("ফোন নম্বর")
+                        if not s_data.get("address"): missing.append("ঠিকানা")
+                        if not s_data.get("items"): missing.append("পণ্য")
+                        needed_info = " ও ".join(missing)
+                        response_msg = f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।"
+                        send_message(token, sender, response_msg)
+                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": response_msg}])
+                        continue
+                
+                # Handle delay intent (customer wants to confirm later)
+                elif intent_type == 'delay':
+                    delay_msg = "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। আমি অপেক্ষায় থাকব। 😊"
+                    send_message(token, sender, delay_msg)
+                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": delay_msg}])
+                    continue
+                
+                # Handle denial intent
+                elif intent_type == 'deny':
+                    deny_msg = "ঠিক আছে, কোনো সমস্যা নেই। যখনই প্রয়োজন হবে, আমরা আছি। ধন্যবাদ! 😊"
+                    send_message(token, sender, deny_msg)
+                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": deny_msg}])
+                    delete_session_from_db(session_id)
+                    continue
+
+                # ====================================================================
+                # FIXED HYBRID MODE LOGIC
+                # Allow AI to reply even if summary was shown, unless user is confirming
+                # ====================================================================
+                if bot_settings.get("hybrid_mode", True):
+                    # Check if session exists (it might be None if order was JUST completed)
+                    if current_session:
+                        reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
+                        
+                        if reply:
+                            # If we are replying and summary was previously shown, it means user is chatting
+                            # So we reset the summary flag so it can be shown again later if needed
+                            if s_data.get("summary_shown", False):
+                                s_data["summary_shown"] = False
+                                save_session_to_db(current_session)
+                            
+                            if product_image:
+                                send_image(token, sender, product_image)
+                            send_message(token, sender, reply)
+                    else:
+                        # Session is None (Fresh Start or Post-Order), send generic reply
+                        reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, {})
+                        if reply:
+                            send_message(token, sender, reply)
+
+                elif bot_settings.get("faq_only_mode", False):
+                    faqs = get_faqs(user_id)
+                    faq_reply = None
+                    for f in faqs:
+                        if f['question'] and f['question'].lower() in text:
+                            faq_reply = f['answer']
+                            break
+                    if faq_reply:
+                        send_message(token, sender, faq_reply)
+                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": faq_reply}])
+
+    return jsonify({"ok": True}), 200
+
 if __name__ == "__main__":
-    # Production settings
-    port = int(os.getenv("PORT", 10000))
-    
-    # For production, use production WSGI server
-    if os.getenv("ENVIRONMENT") == "production":
-        from waitress import serve
-        serve(app, host="0.0.0.0", port=port, threads=50)
-    else:
-        app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
