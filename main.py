@@ -4,7 +4,6 @@ import logging
 import requests
 import json
 import time
-import random
 from typing import Optional, Dict, Tuple, List, Any
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
@@ -17,8 +16,6 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 processed_messages = {}
-# API Key rotation tracking
-api_key_rotation = {}
 
 # Supabase Client Setup
 try:
@@ -28,118 +25,6 @@ try:
     )
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
-
-# ================= API KEY ROTATION SYSTEM =================
-def get_rotated_api_keys(user_id: str) -> List[str]:
-    """
-    Get all valid API keys with intelligent rotation
-    """
-    try:
-        # Get API keys from database
-        res = supabase.table("api_keys").select(
-            "groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5"
-        ).eq("user_id", user_id).execute()
-        
-        if not res.data:
-            logger.error(f"No API keys found for user {user_id}")
-            return []
-        
-        row = res.data[0]
-        all_keys = [
-            row.get('groq_api_key'),
-            row.get('groq_api_key_2'), 
-            row.get('groq_api_key_3'),
-            row.get('groq_api_key_4'),
-            row.get('groq_api_key_5')
-        ]
-        
-        # Filter valid keys
-        valid_keys = [k.strip() for k in all_keys if k and k.strip()]
-        
-        if not valid_keys:
-            logger.error(f"No valid API keys for user {user_id}")
-            return []
-        
-        # Initialize rotation tracking for this user if not exists
-        if user_id not in api_key_rotation:
-            api_key_rotation[user_id] = {
-                'keys': valid_keys,
-                'current_index': 0,
-                'last_used': {},
-                'error_count': {}
-            }
-        else:
-            # Update keys if changed
-            api_key_rotation[user_id]['keys'] = valid_keys
-        
-        return valid_keys
-        
-    except Exception as e:
-        logger.error(f"Error getting API keys for user {user_id}: {e}")
-        return []
-
-def get_next_api_key(user_id: str) -> Optional[str]:
-    """
-    Get next API key with round-robin rotation and error handling
-    """
-    try:
-        valid_keys = get_rotated_api_keys(user_id)
-        if not valid_keys:
-            return None
-        
-        rotation_info = api_key_rotation[user_id]
-        keys = rotation_info['keys']
-        
-        # If only one key, return it
-        if len(keys) == 1:
-            return keys[0]
-        
-        # Try to find a key that hasn't had recent errors
-        current_time = time.time()
-        
-        # First, try keys without recent errors
-        for i in range(len(keys)):
-            key_index = (rotation_info['current_index'] + i) % len(keys)
-            key = keys[key_index]
-            
-            # Check if this key has recent errors
-            last_error_time = rotation_info['error_count'].get(key, 0)
-            if current_time - last_error_time > 300:  # 5 minutes cooldown
-                # Update rotation index
-                rotation_info['current_index'] = (key_index + 1) % len(keys)
-                rotation_info['last_used'][key] = current_time
-                return key
-        
-        # If all keys have recent errors, return the one with oldest error
-        oldest_error_time = float('inf')
-        best_key = keys[0]
-        
-        for key in keys:
-            error_time = rotation_info['error_count'].get(key, 0)
-            if error_time < oldest_error_time:
-                oldest_error_time = error_time
-                best_key = key
-        
-        return best_key
-        
-    except Exception as e:
-        logger.error(f"Error in API key rotation for user {user_id}: {e}")
-        valid_keys = get_rotated_api_keys(user_id)
-        return valid_keys[0] if valid_keys else None
-
-def mark_api_key_error(user_id: str, api_key: str):
-    """
-    Mark an API key as having an error (rate limit, etc.)
-    """
-    try:
-        if user_id in api_key_rotation:
-            rotation_info = api_key_rotation[user_id]
-            rotation_info['error_count'][api_key] = time.time()
-            
-            # Log the error
-            logger.warning(f"Marked API key error for user {user_id}. Key: {api_key[:20]}...")
-    except Exception as e:
-        logger.error(f"Error marking API key error: {e}")
 
 # ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
@@ -215,7 +100,7 @@ class OrderSession:
         self.customer_id = customer_id
         self.session_id = f"order_{user_id}_{customer_id}"
         self.step = 0 
-        self.data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0, "summary_shown": False}
+        self.data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
 
     def save_order(self, product_total: float, delivery_charge: float) -> bool:
         try:
@@ -242,7 +127,7 @@ def get_session_from_db(session_id: str) -> Optional[OrderSession]:
             row = res.data[0]
             session = OrderSession(row['user_id'], row['customer_id'])
             session.step = row['step']
-            default_data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0, "summary_shown": False}
+            default_data = {"name": "", "phone": "", "product": "", "items": [], "address": "", "delivery_charge": 0, "total": 0}
             default_data.update(row['data']) 
             session.data = default_data
             return session
@@ -405,8 +290,8 @@ def update_product_stock(user_id: str, product_name: str, quantity_sold: int) ->
         logger.error(f"Error updating product stock: {str(e)}", exc_info=True)
     return False
 
-# ================= AI LOGIC WITH FIXED API KEY ROTATION =================
-def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=3):
+# ================= AI LOGIC =================
+def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
     business = get_business_settings(user_id)
     products = get_products_with_details(user_id)
     faqs = get_faqs(user_id)
@@ -501,15 +386,6 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 - **গুরুত্বপূর্ণ নিয়ম: ব্যবসার তথ্য (business details) কখনোই গ্রাহকের তথ্য (customer details) হিসাবে নিবে না।** - যদি গ্রাহক ব্যবসার নাম/ঠিকানা/নম্বর জিজ্ঞেস করে, তুমি সেটা উত্তর দিবে কিন্তু সেটাকে গ্রাহকের নিজের তথ্য হিসাবে গণ্য করবে না।
   - শুধুমাত্র যখন গ্রাহক সরাসরি বলে "আমার নাম X", "আমার ফোন Y", "আমার ঠিকানা Z" - তখনই সেটাকে গ্রাহকের তথ্য হিসাবে নিবে।
 
-**CRITICAL RULES FOR ORDER CONFIRMATION (MUST FOLLOW):**
-1. তুমি কখনোই গ্রাহককে "Confirm" বলবে না।
-2. তুমি কখনোই "অর্ডার কনফার্ম হয়েছে" বা "সফল হয়েছে" বলবে না।
-3. যদি গ্রাহক "confirm" বলে বা কনফার্ম করতে চায়:
-   - যদি সব তথ্য (নাম, ফোন, ঠিকানা, পণ্য) না থাকে: "দুঃখিত, আপনার [অমুক] তথ্য এখনো পাওয়া যায়নি।"
-   - যদি সব তথ্য থাকে: "সব তথ্য পাওয়া গেছে। অর্ডার সামারি দেখানো হচ্ছে..."
-4. শুধুমাত্র SYSTEM (তুমি নও) অর্ডার কনফার্ম করতে পারবে।
-5. তুমি শুধু তথ্য সংগ্রহ করবে, কখনোই অর্ডার সামারি তৈরি করবে না।
-
 **নতুন অর্ডার শুরু করার নিয়ম (IMPORTANT):**
 - যদি গ্রাহক একটি অর্ডার কনফার্ম করে এবং তারপর আবার কথা শুরু করে, তুমি নতুন করে স্বাগতম জানাবে এবং নতুন অর্ডার নেওয়ার প্রক্রিয়া শুরু করবে।
 - কনফার্ম হওয়া অর্ডারের জন্য ধন্যবাদ জানাবে এবং জিজ্ঞেস করবে নতুন কিছু প্রয়োজন কিনা।
@@ -544,20 +420,21 @@ FAQ: {faq_text}
 
     memory = get_chat_memory(user_id, customer_id)
     
-    # Get API keys with rotation
-    valid_keys = get_rotated_api_keys(user_id)
+    api_key_res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
     
-    if not valid_keys:
+    if not api_key_res.data:
         logger.error(f"No API keys found for user {user_id}")
         return None, None
+    
+    row = api_key_res.data[0]
+    keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
+    valid_keys = [k for k in keys if k and k.strip()]
 
-    # Try each key with intelligent rotation
-    for attempt in range(max_retries):
-        api_key = get_next_api_key(user_id)
-        if not api_key:
-            continue
-            
-        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
+    if not valid_keys:
+        return None, None
+
+    for key in valid_keys:
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
         try:
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -588,32 +465,22 @@ FAQ: {faq_text}
                     matched_image = product.get('image_url')
             
             return reply, matched_image
-            
         except Exception as e:
-            logger.error(f"AI Generation Error with key {api_key[:20]}...: {e}")
-            # Mark this key as having an error
-            mark_api_key_error(user_id, api_key)
-            
-            # Check if it's a rate limit error
-            if "rate_limit" in str(e) or "429" in str(e):
-                logger.warning(f"Rate limit hit for key {api_key[:20]}..., trying next key")
-                # Small delay before trying next key
-                time.sleep(1)
-                continue
-            else:
-                # Other error, try next key
-                continue
+            logger.error(f"AI Generation Error: {e}")
+            continue 
     
-    logger.error(f"All API keys failed for user {user_id} after {max_retries} attempts")
     return None, None
 
-# ================= ORDER EXTRACTION WITH API ROTATION =================
-def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_retries=3):
-    # Get API keys with rotation
-    valid_keys = get_rotated_api_keys(user_id)
+# ================= ORDER EXTRACTION (DYNAMIC SAAS VERSION) =================
+def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_retries=2):
+    api_key_res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
+    if not api_key_res.data: return None
     
-    if not valid_keys: 
-        return None
+    row = api_key_res.data[0]
+    keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
+    valid_keys = [k for k in keys if k and k.strip()]
+
+    if not valid_keys: return None
 
     # --- DYNAMIC PROMPT FOR SAAS (NO HARDCODING) ---
     prompt = (
@@ -633,13 +500,8 @@ def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_r
         "10. Return ONLY a valid JSON object."
     )
 
-    # Try each key with intelligent rotation
-    for attempt in range(max_retries):
-        api_key = get_next_api_key(user_id)
-        if not api_key:
-            continue
-            
-        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
+    for key in valid_keys:
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
         try:
             res = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -660,23 +522,9 @@ def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_r
                     extracted_json['delivery_charge'] = 0.0  # Default to 0 instead of None
                     
             return extracted_json
-            
         except Exception as e:
-            logger.error(f"Extraction Error with key {api_key[:20]}...: {e}")
-            # Mark this key as having an error
-            mark_api_key_error(user_id, api_key)
-            
-            # Check if it's a rate limit error
-            if "rate_limit" in str(e) or "429" in str(e):
-                logger.warning(f"Rate limit hit for extraction key {api_key[:20]}..., trying next key")
-                # Small delay before trying next key
-                time.sleep(1)
-                continue
-            else:
-                # Other error, try next key
-                continue
-    
-    logger.error(f"All API keys failed for extraction for user {user_id} after {max_retries} attempts")
+            logger.error(f"Extraction Error: {e}")
+            continue
     return None
 
 # ================= IMPROVED PRODUCT MATCHING =================
@@ -832,11 +680,11 @@ def show_order_summary(token, customer_id, session_data, business_name):
     total_amount = items_total + delivery_charge
     
     summary_message = (
-        f"📋 **অর্ডার সামারি** 📋\n\n"
+        f"📋 অর্ডার সামারি 📋\n\n"
         f"পণ্য:\n" + "\n".join(summary_lines) + f"\n\n"
         f"পণ্যের মূল্য: ৳{items_total}\n"
         f"ডেলিভারি চার্জ: ৳{delivery_charge}\n"
-        f"**মোট টাকা: ৳{total_amount}**\n\n"
+        f"মোট টাকা: ৳{total_amount}\n\n"
         f"গ্রাহক তথ্য:\n"
         f"• নাম: {session_data.get('name', 'নেই')}\n"
         f"• ফোন: {session_data.get('phone', 'নেই')}\n"
@@ -962,33 +810,6 @@ def webhook():
                 session_id = f"order_{user_id}_{sender}"
                 current_session = get_session_from_db(session_id)
                 
-                # =========== FIXED: PREVENT AI FROM REPLYING TO CONFIRMATION ===========
-                # Check if this is a confirmation message BEFORE processing
-                if any(word in text for word in ['confirm', 'কনফার্ম', 'ok', 'ঠিক আছে', 'yes', 'হ্যা', 'হ্যাঁ']):
-                    if current_session:
-                        s_data = current_session.data
-                        has_all_info = all([s_data.get("name"), s_data.get("phone"), 
-                                          s_data.get("address"), s_data.get("items")])
-                        
-                        if has_all_info:
-                            # Show order summary immediately (skip AI)
-                            business = get_business_settings(user_id)
-                            business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
-                            s_data['user_id_from_session'] = user_id
-                            
-                            # Mark summary as shown first
-                            s_data["summary_shown"] = True
-                            current_session.data = s_data
-                            save_session_to_db(current_session)
-                            
-                            # Then show summary
-                            summary_message = show_order_summary(token, sender, s_data, business_name)
-                            
-                            # Save to chat memory
-                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, 
-                                                                      {"role": "assistant", "content": summary_message}])
-                            continue  # Skip AI processing
-                
                 # If no session exists, send welcome message
                 if not current_session:
                     if welcome_msg and not memory:
@@ -1089,7 +910,7 @@ def webhook():
                     
                     # Save to chat memory
                     save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": summary_message}])
-                    continue  # Skip AI processing after showing summary
+                    return jsonify({"ok": True}), 200
                 
                 # SMART ORDER CONFIRMATION DETECTION
                 is_confirmation, intent_type = detect_order_confirmation_intent(raw_text, s_data)
@@ -1145,13 +966,13 @@ def webhook():
                             stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products)
                             send_message(token, sender, stock_msg)
                             save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
-                            continue
+                            return jsonify({"ok": True}), 200
                         
                         if insufficient_stock_products:
                             stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products)
                             send_message(token, sender, stock_msg)
                             save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
-                            continue
+                            return jsonify({"ok": True}), 200
                         
                         # If stock check passed, calculate total and process order
                         if order_success:
@@ -1183,7 +1004,7 @@ def webhook():
                                     error_msg = f"❌ দুঃখিত, নিম্নলিখিত পণ্যগুলোর স্টক আপডেট করতে সমস্যা হয়েছে: {', '.join(failed_products)}"
                                     send_message(token, sender, error_msg)
                                     save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                                    continue
+                                    return jsonify({"ok": True}), 200
                                 
                                 # Save order to database
                                 if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
@@ -1192,8 +1013,7 @@ def webhook():
                                         f"অর্ডার সামারি:\n{', '.join(summary_list)}\n"
                                         f"মোট: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জ সহ)\n\n"
                                         f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো।\n\n"
-                                        f"আপনি কি আরেকটি অর্ডার দিতে চান?\n"
-                                        f"হ্যাঁ হলে শুধু বলুন 'হ্যাঁ' বা নতুন পণ্যের নাম বলুন। 😊"
+                                        f"আমাদের প্রতি বিশ্বাস রাখার জন্য আপনাকে অনেক ধন্যবাদ। ❤️"
                                     )
                                     send_message(token, sender, confirm_msg)
                                     save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": confirm_msg}])
@@ -1224,7 +1044,7 @@ def webhook():
                                 send_message(token, sender, error_msg)
                                 save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
                         
-                        continue
+                        return jsonify({"ok": True}), 200
                     else:
                         # Customer said confirm but info is not complete
                         missing = []
@@ -1236,14 +1056,14 @@ def webhook():
                         response_msg = f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।"
                         send_message(token, sender, response_msg)
                         save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": response_msg}])
-                        continue
+                        return jsonify({"ok": True}), 200
                 
                 # Handle delay intent (customer wants to confirm later)
                 elif intent_type == 'delay':
                     delay_msg = "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। আমি অপেক্ষায় থাকব। 😊"
                     send_message(token, sender, delay_msg)
                     save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": delay_msg}])
-                    continue
+                    return jsonify({"ok": True}), 200
                 
                 # Handle denial intent
                 elif intent_type == 'deny':
@@ -1251,7 +1071,7 @@ def webhook():
                     send_message(token, sender, deny_msg)
                     save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": deny_msg}])
                     delete_session_from_db(session_id)
-                    continue
+                    return jsonify({"ok": True}), 200
 
                 # ====================================================================
                 # FIXED HYBRID MODE LOGIC
