@@ -4,6 +4,7 @@ import logging
 import requests
 import json
 import time
+import threading  # <--- নতুন যুক্ত করা হয়েছে
 from typing import Optional, Dict, Tuple, List, Any
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 processed_messages = {}
+
+# --- নতুন: মেসেজ বাফারিং এর জন্য গ্লোবাল ভেরিয়েবল ---
+user_queues = {}  
+user_timers = {}
 
 # Supabase Client Setup
 try:
@@ -381,15 +386,12 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
 অর্ডার আচরণ (Very Strict Rules - মনোযোগ দিয়ে শোনো):
 - যতক্ষণ পর্যন্ত গ্রাহকের **নাম (Name)** এবং **ফোন নম্বর (Phone)** এবং **ঠিকানা (Address)** না পাচ্ছ, ততক্ষণ পর্যন্ত ভুলেও "Confirm" বা "কনফার্ম" শব্দটি ব্যবহার করবে না।
 - যদি নাম বা ফোন নম্বর না থাকে, তবে সুন্দর করে সেটি চাও। অর্ডার সামারি দেখাবে না।
-- শুধুমাত্র নাম, ফোন এবং ঠিকানা পাওয়ার পরেই তুমি অর্ডার সামারি দেখাবে এবং গ্রাহককে কনফার্ম করতে বলবে।
-- তুমি নিজে কখনো বলবে না যে অর্ডার কনফার্ম হয়েছে বা সফল হয়েছে। তুমি শুধু গ্রাহককে তথ্য দিয়ে সাহায্য করবে এবং সব তথ্য পেলে বলবে যে অর্ডারটি কনফার্ম করতে 'Confirm' লিখতে।
-- **গুরুত্বপূর্ণ নিয়ম: ব্যবসার তথ্য (business details) কখনোই গ্রাহকের তথ্য (customer details) হিসাবে নিবে না।** - যদি গ্রাহক ব্যবসার নাম/ঠিকানা/নম্বর জিজ্ঞেস করে, তুমি সেটা উত্তর দিবে কিন্তু সেটাকে গ্রাহকের নিজের তথ্য হিসাবে গণ্য করবে না।
-  - শুধুমাত্র যখন গ্রাহক সরাসরি বলে "আমার নাম X", "আমার ফোন Y", "আমার ঠিকানা Z" - তখনই সেটাকে গ্রাহকের তথ্য হিসাবে নিবে।
+- **System Prompt Critical Rule:** তুমি নিজে কোনো অর্ডার সামারি তৈরি করবে না বা "অর্ডার কনফার্ম" বলবে না। তুমি শুধু বলবে "ধন্যবাদ, আমি আপনার তথ্যগুলো পেয়েছি।" বা "আপনার তথ্য সিস্টেম যাচাই করছে।"
+- অর্ডার সামারি সিস্টেম থেকে অটোমেটিক পাঠানো হবে। তুমি নিজে থেকে কোনো সামারি বা কনফার্মেশন মেসেজ লিখবে না।
+- **গুরুত্বপূর্ণ নিয়ম: ব্যবসার তথ্য (business details) কখনোই গ্রাহকের তথ্য (customer details) হিসাবে নিবে না।**
 
 **নতুন অর্ডার শুরু করার নিয়ম (IMPORTANT):**
 - যদি গ্রাহক একটি অর্ডার কনফার্ম করে এবং তারপর আবার কথা শুরু করে, তুমি নতুন করে স্বাগতম জানাবে এবং নতুন অর্ডার নেওয়ার প্রক্রিয়া শুরু করবে।
-- কনফার্ম হওয়া অর্ডারের জন্য ধন্যবাদ জানাবে এবং জিজ্ঞেস করবে নতুন কিছু প্রয়োজন কিনা।
-- গ্রাহক নতুন অর্ডার দিতে চাইলে পুরো প্রক্রিয়া আবার শুরু করবে।
 
 তোমার জন্য কঠোর নিয়মাবলী:
 ১. শুধুমাত্র বাংলা ভাষা: তুমি গ্রাহকের সাথে সর্বদা এবং বাধ্যতামূলকভাবে বাংলায় কথা বলবে। কোনো ইংরেজি বাক্য বা মিশ্র ভাষা ব্যবহার করবে না কিন্তু পণ্যের নাম ডাটাবেসে যেভাবে আছে, ঠিক সেভাবেই বলবে। নামের অনুবাদ করবে না।
@@ -517,9 +519,13 @@ def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_r
             # Ensure delivery_charge is returned as a number (0 if null)
             if 'delivery_charge' in extracted_json:
                 try:
-                    extracted_json['delivery_charge'] = float(extracted_json['delivery_charge'])
+                    val = extracted_json['delivery_charge']
+                    if val is None or str(val).lower() == 'null':
+                        extracted_json['delivery_charge'] = 0.0
+                    else:
+                        extracted_json['delivery_charge'] = float(val)
                 except (TypeError, ValueError):
-                    extracted_json['delivery_charge'] = 0.0  # Default to 0 instead of None
+                    extracted_json['delivery_charge'] = 0.0
                     
             return extracted_json
         except Exception as e:
@@ -620,19 +626,9 @@ def detect_order_confirmation_intent(text: str, session_data: Dict) -> Tuple[boo
     # Check for confirmation
     for pattern in confirm_patterns:
         if re.search(pattern, text_lower, re.IGNORECASE):
-            # Additional check: if customer has all required info
-            has_required_info = all([
-                session_data.get("name"),
-                session_data.get("phone"), 
-                session_data.get("address"),
-                session_data.get("items")
-            ])
-            
-            if has_required_info:
-                return True, 'confirm'
-            else:
-                # Customer said confirm but missing info
-                return False, 'incomplete'
+            # We return True for confirmation intent regardless of whether info is complete
+            # The completeness check happens in the webhook logic
+            return True, 'confirm'
     
     # Check for delay
     for pattern in delay_patterns:
@@ -743,7 +739,324 @@ def send_followup():
         logger.error(f"Follow-up execution error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ================= WEBHOOK =================
+# ================= BATCHED MESSAGE PROCESSOR (NEW) =================
+def process_batched_messages(sender, user_id, page_id, token):
+    """
+    Processes all accumulated messages from the queue after the timer expires.
+    This runs in a separate thread.
+    """
+    try:
+        if sender not in user_queues or not user_queues[sender]:
+            return
+
+        # 1. Combine all messages into one text block
+        # Using space to join.
+        raw_text_list = user_queues[sender]
+        raw_text = " ".join(raw_text_list)
+        text = raw_text.lower().strip()
+        
+        # Clear the queue for this user immediately
+        user_queues[sender] = []
+        if sender in user_timers:
+            del user_timers[sender]
+
+        # 2. Show typing indicator (User knows bot is thinking)
+        send_sender_action(token, sender, "typing_on")
+
+        # 3. Check Subscription
+        if not check_subscription_status(user_id):
+            logger.info(f"Subscription inactive for user {user_id}. Bot silent.")
+            return
+
+        # 4. Get Bot Settings & Handle Delay
+        bot_settings = get_bot_settings(user_id)
+        if not bot_settings.get("ai_reply_enabled", True):
+            return
+        
+        # --- DATABASE DELAY LOGIC MOVED HERE ---
+        # This sleep happens in the background thread, so it doesn't block the server
+        delay_ms = bot_settings.get("typing_delay", 0)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+
+        # 5. Core Logic (Copied from original Webhook)
+        memory = get_chat_memory(user_id, sender)
+        welcome_msg = bot_settings.get("welcome_message")
+        
+        # Check if this is a fresh start after order confirmation
+        session_id = f"order_{user_id}_{sender}"
+        current_session = get_session_from_db(session_id)
+        
+        # If no session exists, send welcome message
+        if not current_session:
+            if welcome_msg and not memory:
+                send_message(token, sender, welcome_msg)
+                save_chat_memory(user_id, sender, [{"role": "assistant", "content": welcome_msg}])
+            
+            current_session = OrderSession(user_id, sender)
+
+        # Update page_id for follow-up purpose
+        try:
+            supabase.table("order_sessions").update({"page_id": page_id}).eq("id", session_id).execute()
+        except: pass
+
+        temp_memory = memory + [{"role": "user", "content": raw_text}]
+        business = get_business_settings(user_id)
+        delivery_policy = business.get('delivery_info', "তথ্য নেই") if business else "তথ্য নেই"
+        
+        extracted = extract_order_data_with_retry(user_id, temp_memory, delivery_policy)
+        
+        if extracted:
+            # --- FIXED: NOTIFY USER ABOUT DELIVERY CHARGE IMMEDIATELY ---
+            had_address = bool(current_session.data.get("address"))
+            data_changed = False # Track if data actually changes
+            
+            # Only update if extracted data is NOT business details
+            business_address = business.get('address', '') if business else ''
+            business_phone = business.get('contact_number', '') if business else ''
+            
+            # Check if extracted address is actually business address
+            if extracted.get("address") and business_address:
+                if business_address.lower() in extracted.get("address", "").lower():
+                    logger.info(f"Ignoring business address as customer address: {extracted.get('address')}")
+                else:
+                    if extracted.get("address") and extracted.get("address") != current_session.data.get("address"): 
+                        current_session.data["address"] = extracted["address"]
+                        data_changed = True
+            elif extracted.get("address") and extracted.get("address") != current_session.data.get("address"):
+                    current_session.data["address"] = extracted["address"]
+                    data_changed = True
+            
+            # Check if extracted phone is actually business phone
+            if extracted.get("phone") and business_phone:
+                if business_phone in extracted.get("phone", ""):
+                    logger.info(f"Ignoring business phone as customer phone: {extracted.get('phone')}")
+                else:
+                    if extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"): 
+                        current_session.data["phone"] = extracted["phone"]
+                        data_changed = True
+            elif extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"):
+                current_session.data["phone"] = extracted["phone"]
+                data_changed = True
+            
+            # For name
+            if extracted.get("name") and extracted.get("name") != current_session.data.get("name"): 
+                current_session.data["name"] = extracted["name"]
+                data_changed = True
+            
+            # For items
+            if extracted.get("items") and extracted.get("items") != current_session.data.get("items"): 
+                current_session.data["items"] = extracted["items"]
+                data_changed = True
+            
+            if "delivery_charge" in extracted and isinstance(extracted["delivery_charge"], (int, float)):
+                    current_session.data["delivery_charge"] = extracted["delivery_charge"]
+                    # Send notification only if address was just now extracted/updated
+                    if not had_address and extracted.get("address"):
+                        send_message(token, sender, f"আপনার ঠিকানায় ডেলিভারি চার্জ ৳{extracted['delivery_charge']}")
+            
+            # Reset follow-up status when customer speaks
+            try:
+                supabase.table("order_sessions").update({"last_followup_sent": None}).eq("id", session_id).execute()
+            except: pass
+            
+            # --- FIXED LOGIC: ONLY RESET SUMMARY IF DATA CHANGED ---
+            is_confirming_now = any(w in text for w in ['confirm', 'ok', 'tik', 'done', 'yes', 'humm', 'ji', 'hae'])
+            
+            if data_changed and not is_confirming_now:
+                    current_session.data["summary_shown"] = False
+            
+            save_session_to_db(current_session)
+
+        s_data = current_session.data
+        has_all_info = all([s_data.get("name"), s_data.get("phone"), s_data.get("address"), s_data.get("items")])
+        
+        # SMART ORDER CONFIRMATION DETECTION
+        is_confirmation, intent_type = detect_order_confirmation_intent(raw_text, s_data)
+
+        # Handle cancellation
+        if "cancel" in text or "বাতিল" in text:
+            delete_session_from_db(session_id)
+            send_message(token, sender, "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।")
+            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।"}])
+            return
+
+        # ====================================================================
+        # LOGIC FLOW FIXED:
+        # 1. First Check if User WANTS to Confirm
+        # 2. Then Check if Summary NEEDS to be Shown
+        # 3. Else let AI reply
+        # ====================================================================
+
+        # Handle confirmation intent (PRIORITY 1)
+        if is_confirmation:
+            if has_all_info:
+                products_db = get_products_with_details(user_id)
+                final_delivery_charge = float(s_data.get('delivery_charge', 0))
+                
+                items_total = 0
+                summary_list = []
+                order_success = True
+                insufficient_stock_products = []
+                out_of_stock_products = []
+                
+                # Stock check
+                for item in s_data.get('items', []):
+                    product_name = item.get('product_name')
+                    qty = int(item.get('quantity', 1))
+                    
+                    if not product_name:
+                        order_success = False
+                        continue
+                    
+                    matched_product = find_best_product_match(product_name, products_db)
+                    
+                    if matched_product:
+                        current_stock = matched_product.get('stock', 0)
+                        in_stock_status = matched_product.get('in_stock', True)
+                        
+                        if not in_stock_status:
+                            order_success = False
+                            out_of_stock_products.append(f"{matched_product['name']} (স্টক নেই)")
+                        elif current_stock < qty:
+                            order_success = False
+                            insufficient_stock_products.append(f"{matched_product['name']} (স্টক: {current_stock}, চাহিদা: {qty})")
+                    else:
+                        order_success = False
+                        send_message(token, sender, f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।")
+                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।"}])
+                
+                if out_of_stock_products:
+                    stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products)
+                    send_message(token, sender, stock_msg)
+                    return
+                
+                if insufficient_stock_products:
+                    stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products)
+                    send_message(token, sender, stock_msg)
+                    return
+                
+                if order_success:
+                    for item in s_data.get('items', []):
+                        product_name = item.get('product_name')
+                        qty = int(item.get('quantity', 1))
+                        matched_product = find_best_product_match(product_name, products_db)
+                        if matched_product:
+                            items_total += matched_product['price'] * qty
+                            summary_list.append(f"{matched_product['name']} x{qty}")
+                            current_session.data['product'] = matched_product['name']
+                    
+                    if items_total > 0:
+                        all_stock_updates_successful = True
+                        failed_products = []
+                        
+                        for item in s_data.get('items', []):
+                            product_name = item.get('product_name')
+                            qty = int(item.get('quantity', 1))
+                            if product_name:
+                                stock_updated = update_product_stock(user_id, product_name, qty)
+                                if not stock_updated:
+                                    failed_products.append(product_name)
+                                    all_stock_updates_successful = False
+                        
+                        if not all_stock_updates_successful:
+                            error_msg = f"❌ দুঃখিত, স্টক আপডেট সমস্যা: {', '.join(failed_products)}"
+                            send_message(token, sender, error_msg)
+                            return
+                        
+                        if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
+                            confirm_msg = (
+                                f"✅ আপনার অর্ডারটি সফলভাবে কনফার্ম হয়েছে!\n\n"
+                                f"অর্ডার সামারি:\n{', '.join(summary_list)}\n"
+                                f"মোট: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জ সহ)\n\n"
+                                f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো। ধন্যবাদ! ❤️"
+                            )
+                            send_message(token, sender, confirm_msg)
+                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": confirm_msg}])
+                            
+                            # Cleanup
+                            try:
+                                supabase.table("chat_history").delete().eq("user_id", user_id).eq("customer_id", sender).execute()
+                            except Exception as e:
+                                logger.error(f"Error clearing chat history: {e}")
+                            delete_session_from_db(session_id)
+                            current_session = None
+                            return # END HERE for confirmed orders
+                        else:
+                            error_msg = "❌ দুঃখিত, অর্ডার সেভ করতে সমস্যা হয়েছে।"
+                            send_message(token, sender, error_msg)
+                            return
+            else:
+                missing = []
+                if not s_data.get("name"): missing.append("নাম")
+                if not s_data.get("phone"): missing.append("ফোন নম্বর")
+                if not s_data.get("address"): missing.append("ঠিকানা")
+                if not s_data.get("items"): missing.append("পণ্য")
+                needed_info = " ও ".join(missing)
+                response_msg = f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।"
+                send_message(token, sender, response_msg)
+                return
+
+        # Handle delay/deny (PRIORITY 2)
+        elif intent_type == 'delay':
+            delay_msg = "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। 😊"
+            send_message(token, sender, delay_msg)
+            return
+        elif intent_type == 'deny':
+            deny_msg = "ঠিক আছে, কোনো সমস্যা নেই। ধন্যবাদ! 😊"
+            send_message(token, sender, deny_msg)
+            delete_session_from_db(session_id)
+            return
+
+        # Show Summary Trigger (PRIORITY 3 - Only if not confirming and has all info)
+        if has_all_info and not s_data.get("summary_shown", False):
+            business = get_business_settings(user_id)
+            business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
+            s_data['user_id_from_session'] = user_id 
+            summary_message = show_order_summary(token, sender, s_data, business_name)
+            
+            s_data["summary_shown"] = True
+            current_session.data = s_data
+            save_session_to_db(current_session)
+            
+            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": summary_message}])
+            return
+
+        # ====================================================================
+        # HYBRID MODE LOGIC (FINAL PRIORITY)
+        # ====================================================================
+        if bot_settings.get("hybrid_mode", True):
+            # Check if session exists (it might be None if order was JUST completed)
+            session_data_for_ai = current_session.data if current_session else {}
+            
+            reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, session_data_for_ai)
+            
+            if reply:
+                if current_session and s_data.get("summary_shown", False):
+                    # Reset summary if user talks after summary but doesn't confirm
+                    current_session.data["summary_shown"] = False
+                    save_session_to_db(current_session)
+                
+                if product_image:
+                    send_image(token, sender, product_image)
+                send_message(token, sender, reply)
+
+        elif bot_settings.get("faq_only_mode", False):
+            faqs = get_faqs(user_id)
+            faq_reply = None
+            for f in faqs:
+                if f['question'] and f['question'].lower() in text:
+                    faq_reply = f['answer']
+                    break
+            if faq_reply:
+                send_message(token, sender, faq_reply)
+                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": faq_reply}])
+
+    except Exception as e:
+        logger.error(f"Error in batched processing: {e}", exc_info=True)
+
+
+# ================= WEBHOOK (UPDATED FOR BATCHING) =================
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -763,7 +1076,7 @@ def webhook():
     if not data: return jsonify({"status": "error"}), 400
 
     if data.get("object") == "page":
-        # Clean old processed messages (once per request, not per message)
+        # Clean old processed messages
         now_ts = time.time()
         processed_messages = {k: v for k, v in processed_messages.items() if now_ts - v < 300}
         
@@ -785,329 +1098,25 @@ def webhook():
 
                 raw_text = msg_event["message"].get("text", "")
                 if not raw_text: continue
-                text = raw_text.lower().strip()
                 
-                # --- NEW: SEND SEEN & TYPING ACTION ---
+                # --- NEW BATCHING LOGIC START ---
+                # 1. Mark Seen immediately so user knows we got it
                 send_sender_action(token, sender, "mark_seen")
-                send_sender_action(token, sender, "typing_on")
 
-                if not check_subscription_status(user_id):
-                    logger.info(f"Subscription inactive for user {user_id}. Bot silent.")
-                    continue
+                # 2. Add message to queue
+                if sender not in user_queues:
+                    user_queues[sender] = []
+                user_queues[sender].append(raw_text)
 
-                bot_settings = get_bot_settings(user_id)
-                if not bot_settings.get("ai_reply_enabled", True):
-                    continue
-                
-                delay_ms = bot_settings.get("typing_delay", 0)
-                if delay_ms > 0:
-                    time.sleep(delay_ms / 1000)
+                # 3. Reset Timer (Debouncing)
+                if sender in user_timers:
+                    user_timers[sender].cancel()
 
-                memory = get_chat_memory(user_id, sender)
-                welcome_msg = bot_settings.get("welcome_message")
-                
-                # Check if this is a fresh start after order confirmation
-                session_id = f"order_{user_id}_{sender}"
-                current_session = get_session_from_db(session_id)
-                
-                # If no session exists, send welcome message
-                if not current_session:
-                    if welcome_msg and not memory:
-                        send_message(token, sender, welcome_msg)
-                        save_chat_memory(user_id, sender, [{"role": "assistant", "content": welcome_msg}])
-                    
-                    current_session = OrderSession(user_id, sender)
-
-                # Update page_id for follow-up purpose
-                try:
-                    supabase.table("order_sessions").update({"page_id": page_id}).eq("id", session_id).execute()
-                except: pass
-
-                temp_memory = memory + [{"role": "user", "content": raw_text}]
-                business = get_business_settings(user_id)
-                delivery_policy = business.get('delivery_info', "তথ্য নেই") if business else "তথ্য নেই"
-                
-                extracted = extract_order_data_with_retry(user_id, temp_memory, delivery_policy)
-                
-                if extracted:
-                    # --- FIXED: NOTIFY USER ABOUT DELIVERY CHARGE IMMEDIATELY ---
-                    had_address = bool(current_session.data.get("address"))
-                    data_changed = False # Track if data actually changes
-                    
-                    # Only update if extracted data is NOT business details
-                    business_address = business.get('address', '') if business else ''
-                    business_phone = business.get('contact_number', '') if business else ''
-                    
-                    # Check if extracted address is actually business address
-                    if extracted.get("address") and business_address:
-                        if business_address.lower() in extracted.get("address", "").lower():
-                            logger.info(f"Ignoring business address as customer address: {extracted.get('address')}")
-                        else:
-                            if extracted.get("address") and extracted.get("address") != current_session.data.get("address"): 
-                                current_session.data["address"] = extracted["address"]
-                                data_changed = True
-                    elif extracted.get("address") and extracted.get("address") != current_session.data.get("address"):
-                         current_session.data["address"] = extracted["address"]
-                         data_changed = True
-                    
-                    # Check if extracted phone is actually business phone
-                    if extracted.get("phone") and business_phone:
-                        if business_phone in extracted.get("phone", ""):
-                            logger.info(f"Ignoring business phone as customer phone: {extracted.get('phone')}")
-                        else:
-                            if extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"): 
-                                current_session.data["phone"] = extracted["phone"]
-                                data_changed = True
-                    elif extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"):
-                        current_session.data["phone"] = extracted["phone"]
-                        data_changed = True
-                    
-                    # For name
-                    if extracted.get("name") and extracted.get("name") != current_session.data.get("name"): 
-                        current_session.data["name"] = extracted["name"]
-                        data_changed = True
-                    
-                    # For items
-                    if extracted.get("items") and extracted.get("items") != current_session.data.get("items"): 
-                        current_session.data["items"] = extracted["items"]
-                        data_changed = True
-                    
-                    if "delivery_charge" in extracted and isinstance(extracted["delivery_charge"], (int, float)):
-                         current_session.data["delivery_charge"] = extracted["delivery_charge"]
-                         # Send notification only if address was just now extracted/updated
-                         if not had_address and extracted.get("address"):
-                             send_message(token, sender, f"আপনার ঠিকানায় ডেলিভারি চার্জ ৳{extracted['delivery_charge']}")
-                    
-                    # Reset follow-up status when customer speaks
-                    try:
-                        supabase.table("order_sessions").update({"last_followup_sent": None}).eq("id", session_id).execute()
-                    except: pass
-                    
-                    # --- FIXED LOGIC: ONLY RESET SUMMARY IF DATA CHANGED ---
-                    # Check if user is confirming - if so, DO NOT reset summary even if data is extracted
-                    is_confirming_now = any(w in text for w in ['confirm', 'ok', 'tik', 'done', 'yes', 'humm', 'ji', 'hae'])
-                    
-                    if data_changed and not is_confirming_now:
-                         current_session.data["summary_shown"] = False
-                    
-                    save_session_to_db(current_session)
-
-                s_data = current_session.data
-                has_all_info = all([s_data.get("name"), s_data.get("phone"), s_data.get("address"), s_data.get("items")])
-                
-                # --- CRITICAL FIX: SHOW ORDER SUMMARY WHEN ALL INFO IS COMPLETE ---
-                if has_all_info and not s_data.get("summary_shown", False):
-                    # Show order summary (SYSTEM reply, not AI)
-                    business = get_business_settings(user_id)
-                    business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
-                    s_data['user_id_from_session'] = user_id  # Add user_id for product lookup
-                    summary_message = show_order_summary(token, sender, s_data, business_name)
-                    
-                    # Mark summary as shown
-                    s_data["summary_shown"] = True
-                    current_session.data = s_data
-                    save_session_to_db(current_session)
-                    
-                    # Save to chat memory
-                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": summary_message}])
-                    return jsonify({"ok": True}), 200
-                
-                # SMART ORDER CONFIRMATION DETECTION
-                is_confirmation, intent_type = detect_order_confirmation_intent(raw_text, s_data)
-                
-                # Handle cancellation
-                if "cancel" in text or "বাতিল" in text:
-                    delete_session_from_db(session_id)
-                    send_message(token, sender, "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।")
-                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।"}])
-                    continue
-                
-                # Handle confirmation intent
-                if is_confirmation:
-                    if has_all_info:
-                        products_db = get_products_with_details(user_id)
-                        final_delivery_charge = float(s_data.get('delivery_charge', 0))
-                        
-                        items_total = 0
-                        summary_list = []
-                        order_success = True
-                        insufficient_stock_products = []
-                        out_of_stock_products = []
-                        
-                        # FIRST: Check stock for ALL items BEFORE processing
-                        for item in s_data.get('items', []):
-                            product_name = item.get('product_name')
-                            qty = int(item.get('quantity', 1))
-                            
-                            if not product_name:
-                                order_success = False
-                                continue
-                            
-                            matched_product = find_best_product_match(product_name, products_db)
-                            
-                            if matched_product:
-                                current_stock = matched_product.get('stock', 0)  # Use 'stock' column
-                                in_stock_status = matched_product.get('in_stock', True)
-                                
-                                # Check both stock and in_stock status
-                                if not in_stock_status:
-                                    order_success = False
-                                    out_of_stock_products.append(f"{matched_product['name']} (স্টক নেই)")
-                                elif current_stock < qty:
-                                    order_success = False
-                                    insufficient_stock_products.append(f"{matched_product['name']} (স্টক: {current_stock}, চাহিদা: {qty})")
-                            else:
-                                order_success = False
-                                send_message(token, sender, f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।")
-                                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।"}])
-                        
-                        # Send appropriate error messages
-                        if out_of_stock_products:
-                            stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products)
-                            send_message(token, sender, stock_msg)
-                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
-                            return jsonify({"ok": True}), 200
-                        
-                        if insufficient_stock_products:
-                            stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products)
-                            send_message(token, sender, stock_msg)
-                            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": stock_msg}])
-                            return jsonify({"ok": True}), 200
-                        
-                        # If stock check passed, calculate total and process order
-                        if order_success:
-                            for item in s_data.get('items', []):
-                                product_name = item.get('product_name')
-                                qty = int(item.get('quantity', 1))
-                                
-                                matched_product = find_best_product_match(product_name, products_db)
-                                if matched_product:
-                                    items_total += matched_product['price'] * qty
-                                    summary_list.append(f"{matched_product['name']} x{qty}")
-                                    current_session.data['product'] = matched_product['name']
-                            
-                            if items_total > 0:
-                                # Update product stock
-                                all_stock_updates_successful = True
-                                failed_products = []
-                                
-                                for item in s_data.get('items', []):
-                                    product_name = item.get('product_name')
-                                    qty = int(item.get('quantity', 1))
-                                    if product_name:
-                                        stock_updated = update_product_stock(user_id, product_name, qty)
-                                        if not stock_updated:
-                                            failed_products.append(product_name)
-                                            all_stock_updates_successful = False
-                                
-                                if not all_stock_updates_successful:
-                                    error_msg = f"❌ দুঃখিত, নিম্নলিখিত পণ্যগুলোর স্টক আপডেট করতে সমস্যা হয়েছে: {', '.join(failed_products)}"
-                                    send_message(token, sender, error_msg)
-                                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                                    return jsonify({"ok": True}), 200
-                                
-                                # Save order to database
-                                if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
-                                    confirm_msg = (
-                                        f"✅ আপনার অর্ডারটি সফলভাবে কনফার্ম হয়েছে!\n\n"
-                                        f"অর্ডার সামারি:\n{', '.join(summary_list)}\n"
-                                        f"মোট: ৳{items_total + final_delivery_charge} (ডেলিভারি চার্জ সহ)\n\n"
-                                        f"আমরা খুব শীঘ্রই আপনার সাথে যোগাযোগ করবো।\n\n"
-                                        f"আমাদের প্রতি বিশ্বাস রাখার জন্য আপনাকে অনেক ধন্যবাদ। ❤️"
-                                    )
-                                    send_message(token, sender, confirm_msg)
-                                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": confirm_msg}])
-                                    
-                                    # ====================================================================
-                                    # CRITICAL FIXES FOR SESSION AND MEMORY RESET
-                                    # ====================================================================
-                                    
-                                    # 1. Clear chat history for this user so AI forgets the old context
-                                    try:
-                                        supabase.table("chat_history").delete().eq("user_id", user_id).eq("customer_id", sender).execute()
-                                    except Exception as e:
-                                        logger.error(f"Error clearing chat history: {e}")
-
-                                    # 2. Delete the session from DB
-                                    delete_session_from_db(session_id)
-                                    
-                                    # 3. Clear local session object
-                                    current_session = None
-                                    
-                                else:
-                                    logger.error(f"Order Save Failed for customer {sender}")
-                                    error_msg = "❌ দুঃখিত, অর্ডার সেভ করতে সমস্যা হয়েছে। দয়া করে আবার চেষ্টা করুন।"
-                                    send_message(token, sender, error_msg)
-                                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                            else:
-                                error_msg = "❌ দুঃখিত, কোনো পণ্য সনাক্ত করা যায়নি।"
-                                send_message(token, sender, error_msg)
-                                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": error_msg}])
-                        
-                        return jsonify({"ok": True}), 200
-                    else:
-                        # Customer said confirm but info is not complete
-                        missing = []
-                        if not s_data.get("name"): missing.append("নাম")
-                        if not s_data.get("phone"): missing.append("ফোন নম্বর")
-                        if not s_data.get("address"): missing.append("ঠিকানা")
-                        if not s_data.get("items"): missing.append("পণ্য")
-                        needed_info = " ও ".join(missing)
-                        response_msg = f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।"
-                        send_message(token, sender, response_msg)
-                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": response_msg}])
-                        return jsonify({"ok": True}), 200
-                
-                # Handle delay intent (customer wants to confirm later)
-                elif intent_type == 'delay':
-                    delay_msg = "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। আমি অপেক্ষায় থাকব। 😊"
-                    send_message(token, sender, delay_msg)
-                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": delay_msg}])
-                    return jsonify({"ok": True}), 200
-                
-                # Handle denial intent
-                elif intent_type == 'deny':
-                    deny_msg = "ঠিক আছে, কোনো সমস্যা নেই। যখনই প্রয়োজন হবে, আমরা আছি। ধন্যবাদ! 😊"
-                    send_message(token, sender, deny_msg)
-                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": deny_msg}])
-                    delete_session_from_db(session_id)
-                    return jsonify({"ok": True}), 200
-
-                # ====================================================================
-                # FIXED HYBRID MODE LOGIC
-                # Allow AI to reply even if summary was shown, unless user is confirming
-                # ====================================================================
-                if bot_settings.get("hybrid_mode", True):
-                    # Check if session exists (it might be None if order was JUST completed)
-                    if current_session:
-                        reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, current_session.data)
-                        
-                        if reply:
-                            # If we are replying and summary was previously shown, it means user is chatting
-                            # So we reset the summary flag so it can be shown again later if needed
-                            if s_data.get("summary_shown", False):
-                                s_data["summary_shown"] = False
-                                save_session_to_db(current_session)
-                            
-                            if product_image:
-                                send_image(token, sender, product_image)
-                            send_message(token, sender, reply)
-                    else:
-                        # Session is None (Fresh Start or Post-Order), send generic reply
-                        reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, {})
-                        if reply:
-                            send_message(token, sender, reply)
-
-                elif bot_settings.get("faq_only_mode", False):
-                    faqs = get_faqs(user_id)
-                    faq_reply = None
-                    for f in faqs:
-                        if f['question'] and f['question'].lower() in text:
-                            faq_reply = f['answer']
-                            break
-                    if faq_reply:
-                        send_message(token, sender, faq_reply)
-                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": faq_reply}])
+                # 4. Start new timer (waits 3.0 seconds for more messages)
+                t = threading.Timer(3.0, process_batched_messages, args=[sender, user_id, page_id, token])
+                user_timers[sender] = t
+                t.start()
+                # --- NEW BATCHING LOGIC END ---
 
     return jsonify({"ok": True}), 200
 
