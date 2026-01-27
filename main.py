@@ -4,21 +4,25 @@ import logging
 import requests
 import json
 import time
-import threading  # <--- নতুন যুক্ত করা হয়েছে
+import threading
 from typing import Optional, Dict, Tuple, List, Any
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from supabase import create_client, Client
 
-# ================= CONFIG =================
+# ================= CONFIG & CACHING =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-processed_messages = {}
+# --- Smart Caching Variables (NEW) ---
+bot_data_cache = {}        # { "user_id_key": (data, timestamp) }
+api_key_status = {}        # { "api_key": blocked_until_timestamp }
+CACHE_EXPIRY = 600         # ১০ মিনিট (ডাটা রিফ্রেশ টাইম)
+KEY_BLOCK_DURATION = 300   # ৫ মিনিট (API Key ব্লক থাকার সময়)
 
-# --- নতুন: মেসেজ বাফারিং এর জন্য গ্লোবাল ভেরিয়েবল ---
+processed_messages = {}
 user_queues = {}  
 user_timers = {}
 
@@ -31,9 +35,42 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
+# ================= SMART CACHING HELPERS (NEW) =================
+def get_cached_data(user_id: str, suffix: str, fetch_func):
+    """
+    Retrieves data from cache or fetches fresh from DB if expired.
+    """
+    now = time.time()
+    cache_key = f"{user_id}_{suffix}"
+    
+    if cache_key in bot_data_cache:
+        data, timestamp = bot_data_cache[cache_key]
+        if now - timestamp < CACHE_EXPIRY:
+            return data
+            
+    # Fetch fresh data
+    try:
+        fresh_data = fetch_func()
+        bot_data_cache[cache_key] = (fresh_data, now)
+        logger.info(f"Cache updated for: {cache_key}")
+        return fresh_data
+    except Exception as e:
+        logger.error(f"Error fetching data for {cache_key}: {e}")
+        # If fetch fails, try to return old cache if exists
+        if cache_key in bot_data_cache:
+            return bot_data_cache[cache_key][0]
+        return None
+
+def block_api_key(api_key: str):
+    """Blocks an API key for a specific duration due to rate limits."""
+    logger.warning(f"Rate limit hit! Blocking key for {KEY_BLOCK_DURATION} seconds.")
+    api_key_status[api_key] = time.time() + KEY_BLOCK_DURATION
+
 # ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
     try:
+        # Subscription status is critical, usually not cached or cached for very short time
+        # Here we keep it real-time as per original logic to avoid access issues
         res = supabase.table("subscriptions").select("status, trial_end, end_date, paid_until").eq("user_id", user_id).execute()
         
         if res.data and len(res.data) > 0:
@@ -51,14 +88,14 @@ def check_subscription_status(user_id: str) -> bool:
                     clean_expiry = expiry_str.strip().replace(' ', 'T')
                     if clean_expiry.endswith('+00'):
                         clean_expiry = clean_expiry.replace('+00', '+00:00')
-
+                    
+                    # Parsing logic same as before
                     try:
                         expiry_date = datetime.fromisoformat(clean_expiry)
                     except ValueError:
                         clean_date_str = expiry_str.strip()
                         if clean_date_str.endswith('+00'):
                             clean_date_str = clean_date_str.replace('+00', '+0000')
-                        
                         try:
                             expiry_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S.%f%z")
                         except ValueError:
@@ -82,21 +119,60 @@ def check_subscription_status(user_id: str) -> bool:
         logger.error(f"Subscription Check Error for user {user_id}: {e}")
         return False
 
-# ================= BOT SETTINGS FETCHER =================
+# ================= DATA FETCHERS (UPDATED WITH CACHE) =================
 def get_bot_settings(user_id: str) -> Dict:
-    try:
+    def fetch():
         res = supabase.table("bot_settings").select("*").eq("user_id", user_id).limit(1).execute()
         if res.data:
             return res.data[0]
-    except Exception as e:
-        logger.error(f"Error fetching bot settings: {e}")
-    return {
-        "ai_reply_enabled": True,
-        "hybrid_mode": True,
-        "faq_only_mode": False,
-        "typing_delay": 0,
-        "welcome_message": ""
-    }
+        return {
+            "ai_reply_enabled": True, "hybrid_mode": True, "faq_only_mode": False,
+            "typing_delay": 0, "welcome_message": ""
+        }
+    return get_cached_data(user_id, "bot_settings", fetch) or {}
+
+def get_business_settings(user_id: str) -> Optional[Dict]:
+    def fetch():
+        res = supabase.table("business_settings").select("*").eq("user_id", user_id).limit(1).execute()
+        return res.data[0] if res.data else {}
+    return get_cached_data(user_id, "biz_settings", fetch)
+
+def get_products_with_details(user_id: str, use_cache=True):
+    """
+    Fetches products.
+    use_cache=True -> Returns cached data (Fast, for Chat)
+    use_cache=False -> Returns fresh data (Slow, for Order Confirmation/Stock Check)
+    """
+    def fetch():
+        res = supabase.table("products").select("*").eq("user_id", user_id).execute()
+        return res.data or []
+    
+    if use_cache:
+        return get_cached_data(user_id, "products", fetch) or []
+    return fetch()
+
+def get_faqs(user_id: str):
+    def fetch():
+        res = supabase.table("faqs").select("question, answer").eq("user_id", user_id).execute()
+        return res.data or []
+    return get_cached_data(user_id, "faqs", fetch) or []
+
+def get_valid_api_keys(user_id: str):
+    """Fetches API keys from DB (cached) and filters out blocked ones."""
+    def fetch():
+        res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
+        if res.data:
+            row = res.data[0]
+            keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
+            return [k for k in keys if k and k.strip()]
+        return []
+    
+    all_keys = get_cached_data(user_id, "api_keys", fetch) or []
+    
+    # Filter out blocked keys
+    now = time.time()
+    valid_keys = [k for k in all_keys if api_key_status.get(k, 0) < now]
+    return valid_keys
 
 # ================= SESSION DB HELPERS =================
 class OrderSession:
@@ -161,6 +237,7 @@ def delete_session_from_db(session_id: str):
 
 # ================= HELPERS (IMAGE & MSG) =================
 def get_page_client(page_id):
+    # This is lightweight, but could be cached if needed. Keeping real-time for safety.
     res = supabase.table("facebook_integrations").select("*").eq("page_id", str(page_id)).eq("is_connected", True).execute()
     return res.data[0] if res.data else None
 
@@ -189,11 +266,7 @@ def send_image(token, user_id, image_url):
     except Exception as e:
         logger.error(f"Failed to send image: {e}")
 
-# ================= SENDER ACTION HELPER (NEW) =================
 def send_sender_action(token, user_id, action):
-    """
-    Sends sender actions like 'mark_seen' or 'typing_on'
-    """
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
     payload = {
         "recipient": {"id": user_id},
@@ -203,20 +276,6 @@ def send_sender_action(token, user_id, action):
         requests.post(url, json=payload)
     except Exception as e:
         logger.error(f"Failed to send sender action {action}: {e}")
-
-# ================= DATA FETCHERS =================
-def get_products_with_details(user_id: str):
-    # Read stock from 'stock' column (not 'quantity')
-    res = supabase.table("products").select("*").eq("user_id", user_id).execute()
-    return res.data or []
-
-def get_faqs(user_id: str):
-    res = supabase.table("faqs").select("question, answer").eq("user_id", user_id).execute()
-    return res.data or []
-
-def get_business_settings(user_id: str) -> Optional[Dict]:
-    res = supabase.table("business_settings").select("*").eq("user_id", user_id).limit(1).execute()
-    return res.data[0] if res.data else None
 
 def get_chat_memory(user_id: str, customer_id: str, limit: int = 10) -> List[Dict]:
     res = supabase.table("chat_history").select("messages").eq("user_id", user_id).eq("customer_id", customer_id).limit(1).execute()
@@ -232,80 +291,50 @@ def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
 
 # ================= PRODUCT STOCK UPDATER =================
 def update_product_stock(user_id: str, product_name: str, quantity_sold: int) -> bool:
-    """Update product stock in database after order confirmation"""
+    """Update product stock in database after order confirmation (Always Real-time)"""
     try:
         logger.info(f"Updating stock for product '{product_name}' for user {user_id}, quantity: {quantity_sold}")
         
-        # First, get all products for the user
-        res = supabase.table("products")\
-            .select("id, stock, name, in_stock")\
-            .eq("user_id", user_id)\
-            .execute()
+        # ALWAYS fetch fresh data here (Bypass Cache)
+        res = supabase.table("products").select("id, stock, name, in_stock").eq("user_id", user_id).execute()
         
         if not res.data:
-            logger.warning(f"No products found for user {user_id}")
             return False
         
-        # Use the improved matching function
         matched_product = find_best_product_match(product_name, res.data)
         
         if not matched_product:
-            logger.warning(f"Product '{product_name}' not found in database. Available products: {[p.get('name') for p in res.data]}")
             return False
         
         product_id = matched_product["id"]
-        current_stock = matched_product.get("stock", 0)  # Use 'stock' column
-        matched_product_name = matched_product.get("name", "")
+        current_stock = matched_product.get("stock", 0)
         in_stock = matched_product.get("in_stock", True)
         
-        logger.info(f"Found product: '{matched_product_name}', Current stock: {current_stock}, In stock: {in_stock}, Requested: {quantity_sold}")
-        
-        # CRITICAL FIX: Check both stock AND in_stock status
-        if not in_stock:
-            logger.error(f"Product '{matched_product_name}' is marked as out of stock (in_stock: {in_stock})")
+        if not in_stock or current_stock < quantity_sold:
             return False
         
-        # Check if enough stock is available
-        if current_stock < quantity_sold:
-            logger.error(f"Insufficient stock for product '{matched_product_name}': {current_stock} available, {quantity_sold} requested")
-            return False
-        
-        # Calculate new stock
         new_stock = max(0, current_stock - quantity_sold)
-        
-        # Update stock in database
         update_data = {"stock": new_stock}
         if new_stock == 0:
             update_data["in_stock"] = False
         
-        # Update stock in database
-        update_res = supabase.table("products")\
-            .update(update_data)\
-            .eq("id", product_id)\
-            .execute()
-        
-        if update_res.data:
-            logger.info(f"Successfully updated stock for product '{matched_product_name}' (ID: {product_id}): {current_stock} -> {new_stock}")
-            return True
-        else:
-            logger.error(f"Failed to update stock for product ID {product_id}")
-            return False
+        update_res = supabase.table("products").update(update_data).eq("id", product_id).execute()
+        return bool(update_res.data)
             
     except Exception as e:
         logger.error(f"Error updating product stock: {str(e)}", exc_info=True)
     return False
 
-# ================= AI LOGIC =================
-def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data, max_retries=2):
+# ================= AI LOGIC (UPDATED WITH SMART API & CACHE) =================
+def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data):
+    # Fetch cached data
     business = get_business_settings(user_id)
-    products = get_products_with_details(user_id)
+    products = get_products_with_details(user_id, use_cache=True)
     faqs = get_faqs(user_id)
     
     biz_phone = business.get('contact_number', '') if business else ""
     business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
     business_address = business.get('address', 'ঠিকানা উপলব্ধ নয়') if business else "ঠিকানা উপলব্ধ নয়"
-    
-    session_charge = current_session_data.get('delivery_charge', 0)
     
     opening_hours = business.get('opening_hours', 'তথ্য নেই') if business else "তথ্য নেই"
     delivery_info = business.get('delivery_info', 'তথ্য নেই') if business else "তথ্য নেই"
@@ -314,20 +343,18 @@ def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session
     categories = sorted(list(set([p.get('category') for p in products if p.get('category')])))
     category_list_str = ", ".join(categories) if categories else "তথ্য নেই"
 
-    # Get current stock information from 'stock' column
     product_list_with_stock = []
     for p in products:
-        stock = p.get("stock", 0)  # Use 'stock' column
+        stock = p.get("stock", 0)
         in_stock_status = p.get("in_stock", True)
         if in_stock_status and stock > 0:
             product_list_with_stock.append(f"- {p.get('name')}: ৳{p.get('price')} (স্টক: {stock})")
     
     product_list_short = "\n".join(product_list_with_stock)
     
-    # Full product details including stock
     product_details_full = []
     for p in products:
-        stock = p.get("stock", 0)  # Use 'stock' column
+        stock = p.get("stock", 0)
         in_stock_status = p.get("in_stock", True)
         if in_stock_status and stock > 0:
             product_details_full.append(f"পণ্য: {p.get('name')}\nদাম: ৳{p.get('price')}\nস্টক: {stock}\nবিবরণ: {p.get('description')}")
@@ -422,17 +449,11 @@ FAQ: {faq_text}
 
     memory = get_chat_memory(user_id, customer_id)
     
-    api_key_res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
-    
-    if not api_key_res.data:
-        logger.error(f"No API keys found for user {user_id}")
-        return None, None
-    
-    row = api_key_res.data[0]
-    keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
-    valid_keys = [k for k in keys if k and k.strip()]
+    # --- SMART API KEY SELECTION ---
+    valid_keys = get_valid_api_keys(user_id)
 
     if not valid_keys:
+        logger.error("All API keys are unavailable or blocked.")
         return None, None
 
     for key in valid_keys:
@@ -447,44 +468,37 @@ FAQ: {faq_text}
             reply = res.choices[0].message.content.strip()
             save_chat_memory(user_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
             
-            # --- FEATURE 2: STRICT IMAGE LOGIC ---
+            # --- STRICT IMAGE LOGIC ---
             matched_image = None
-            
-            # 1. Check if user explicitly asked for image
             image_request_keywords = ['chobi', 'photo', 'image', 'dekhan', 'dekhi', 'ছবি', 'দেখাও', 'দেখি', 'pic']
             wants_to_see_image = any(word in user_msg.lower() for word in image_request_keywords)
-            
-            # 2. Check if ANY image was sent previously in this conversation
             already_sent_image = any("image_url" in str(m) or "attachment" in str(m) for m in memory)
-
-            # 3. Check product mentions
             mentioned_products = [p for p in products if p.get('name') and p.get('name').lower() in reply.lower()]
 
-            # Logic: Send ONLY if user asks OR (Single product discussed AND No image sent before)
             if len(mentioned_products) == 1:
                 product = mentioned_products[0]
                 if wants_to_see_image or not already_sent_image:
                     matched_image = product.get('image_url')
             
             return reply, matched_image
+
         except Exception as e:
+            error_msg = str(e).lower()
+            # If Rate Limit Error, Block the Key
+            if "rate_limit" in error_msg or "429" in error_msg:
+                block_api_key(key)
+                continue # Try next key
+            
             logger.error(f"AI Generation Error: {e}")
             continue 
     
     return None, None
 
-# ================= ORDER EXTRACTION (DYNAMIC SAAS VERSION) =================
+# ================= ORDER EXTRACTION (UPDATED) =================
 def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_retries=2):
-    api_key_res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
-    if not api_key_res.data: return None
-    
-    row = api_key_res.data[0]
-    keys = [row.get('groq_api_key'), row.get('groq_api_key_2'), row.get('groq_api_key_3'), row.get('groq_api_key_4'), row.get('groq_api_key_5')]
-    valid_keys = [k for k in keys if k and k.strip()]
-
+    valid_keys = get_valid_api_keys(user_id)
     if not valid_keys: return None
 
-    # --- DYNAMIC PROMPT FOR SAAS (NO HARDCODING) ---
     prompt = (
         "Extract order details from the conversation into JSON. "
         "Keys: name, phone, address, items (product_name, quantity), delivery_charge (number or null). "
@@ -516,7 +530,6 @@ def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_r
             cleaned_content = re.sub(r"```json|```", "", content).strip()
             extracted_json = json.loads(cleaned_content)
             
-            # Ensure delivery_charge is returned as a number (0 if null)
             if 'delivery_charge' in extracted_json:
                 try:
                     val = extracted_json['delivery_charge']
@@ -529,131 +542,70 @@ def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_r
                     
             return extracted_json
         except Exception as e:
+            error_msg = str(e).lower()
+            if "rate_limit" in error_msg or "429" in error_msg:
+                block_api_key(key)
+                continue
             logger.error(f"Extraction Error: {e}")
             continue
     return None
 
 # ================= IMPROVED PRODUCT MATCHING =================
 def find_best_product_match(product_name: str, products_db: List[Dict]) -> Optional[Dict]:
-    """
-    Find the best matching product using exact matching first, then word boundary matching
-    Solves the issue where 'iPhone 15' might incorrectly match 'iPhone 15 Pro'
-    """
-    if not product_name or not products_db:
-        return None
-    
+    if not product_name or not products_db: return None
     product_name_lower = product_name.lower().strip()
     
-    # 1. Try exact case-insensitive match first
+    # 1. Exact match
     for product in products_db:
         if product.get('name') and product['name'].lower() == product_name_lower:
             return product
     
-    # 2. Try word boundary matching (product name as whole word)
-    # This prevents "iPhone 15" matching "iPhone 15 Pro"
+    # 2. Word boundary match
     for product in products_db:
         db_name = product.get('name', '').lower()
         if db_name:
-            # Check if product_name appears as a whole word in db_name
             pattern = r'\b' + re.escape(product_name_lower) + r'\b'
-            if re.search(pattern, db_name):
-                return product
+            if re.search(pattern, db_name): return product
     
-    # 3. Try if db_name appears as whole word in product_name
+    # 3. Inverse word match
     for product in products_db:
         db_name = product.get('name', '').lower()
         if db_name:
             pattern = r'\b' + re.escape(db_name) + r'\b'
-            if re.search(pattern, product_name_lower):
-                return product
+            if re.search(pattern, product_name_lower): return product
     
-    # 4. Fallback to substring matching (original logic)
+    # 4. Substring match
     for product in products_db:
         db_name = product.get('name', '').lower()
         if db_name and (product_name_lower in db_name or db_name in product_name_lower):
             return product
-    
     return None
 
 # ================= SMART ORDER CONFIRMATION DETECTION =================
 def detect_order_confirmation_intent(text: str, session_data: Dict) -> Tuple[bool, str]:
-    """
-    Smart detection of order confirmation intent.
-    Returns (is_confirmation, intent_type)
-    intent_type: 'confirm', 'delay', 'deny', or 'neutral'
-    """
     text_lower = text.lower().strip()
     
-    # Relaxed patterns to ensure "okay confirm", "hae confirm", etc. are caught
-    confirm_patterns = [
-        r'confirm',  # Matches "confirm" anywhere in the text
-        r'কনফার্ম',
-        r'ঠিক আছে',
-        r'ok',
-        r'okay',
-        r'hae',
-        r'ji',
-        r'হ্যা',
-        r'জি',
-        r'yes',
-        r'done',
-        r'agreed',
-        r'নিশ্চিত',
-        r'পাঠান',
-        r'send',
-        r'\+1',
-        r'\👍',
-        r'\✅'
-    ]
+    confirm_patterns = [r'confirm', r'কনফার্ম', r'ঠিক আছে', r'ok', r'okay', r'hae', r'ji', r'হ্যা', r'জি', r'yes', r'done', r'agreed', r'নিশ্চিত', r'পাঠান', r'send', r'\+1', r'\👍', r'\✅']
+    delay_patterns = [r'(পরে|পর্য|later|আগে|after|wait|hold on|দেরি)', r'(আরেকটু.*পর্য|wait.*bit)', r'(think.*করব|think.*করি|ভেবে.*দেখি)', r'(not.*now|now.*not|এখন.*না)', r'(কিছুক্ষন.*পর্য|few.*minutes)']
+    deny_patterns = [r'^(no|না|নাহ|না ধন্যবাদ|no thanks|not now)$', r'^(cancel|বাতিল|stop|স্টপ)$', r'^(don\'t.*want|চাইনা|চাই না)$', r'^(maybe.*later|maybe.*পর্য)']
     
-    # Delay patterns - Customer wants to confirm later
-    delay_patterns = [
-        r'(পরে|পর্য|later|আগে|after|wait|hold on|দেরি)',
-        r'(আরেকটু.*পর্য|wait.*bit)',
-        r'(think.*করব|think.*করি|ভেবে.*দেখি)',
-        r'(not.*now|now.*not|এখন.*না)',
-        r'(কিছুক্ষন.*পর্য|few.*minutes)'
-    ]
-    
-    # Denial patterns - Customer doesn't want to order
-    deny_patterns = [
-        r'^(no|না|নাহ|না ধন্যবাদ|no thanks|not now)$',
-        r'^(cancel|বাতিল|stop|স্টপ)$',
-        r'^(don\'t.*want|চাইনা|চাই না)$',
-        r'^(maybe.*later|maybe.*পর্য)'
-    ]
-    
-    # Check for confirmation
     for pattern in confirm_patterns:
-        if re.search(pattern, text_lower, re.IGNORECASE):
-            # We return True for confirmation intent regardless of whether info is complete
-            # The completeness check happens in the webhook logic
-            return True, 'confirm'
-    
-    # Check for delay
+        if re.search(pattern, text_lower, re.IGNORECASE): return True, 'confirm'
     for pattern in delay_patterns:
-        if re.search(pattern, text_lower, re.IGNORECASE):
-            return False, 'delay'
-    
-    # Check for denial
+        if re.search(pattern, text_lower, re.IGNORECASE): return False, 'delay'
     for pattern in deny_patterns:
-        if re.search(pattern, text_lower, re.IGNORECASE):
-            return False, 'deny'
+        if re.search(pattern, text_lower, re.IGNORECASE): return False, 'deny'
     
     return False, 'neutral'
 
 # ================= ORDER SUMMARY DISPLAY =================
 def show_order_summary(token, customer_id, session_data, business_name):
-    """
-    Show order summary when all information is complete
-    This runs INSTEAD of AI reply
-    """
     items = session_data.get('items', [])
     delivery_charge = session_data.get('delivery_charge', 0)
     
-    # Get products to calculate price
+    # Cached products are fine for summary display (price mostly static)
     user_id = session_data.get('user_id_from_session', '')
-    products_db = get_products_with_details(user_id) if user_id else []
+    products_db = get_products_with_details(user_id, use_cache=True) if user_id else []
     
     summary_lines = []
     items_total = 0
@@ -661,8 +613,6 @@ def show_order_summary(token, customer_id, session_data, business_name):
     for item in items:
         product_name = item.get('product_name', '')
         quantity = item.get('quantity', 1)
-        
-        # Find product to get price
         product = find_best_product_match(product_name, products_db)
         if product:
             price = product.get('price', 0)
@@ -672,7 +622,6 @@ def show_order_summary(token, customer_id, session_data, business_name):
         else:
             summary_lines.append(f"• {product_name} x{quantity}")
     
-    # Calculate total
     total_amount = items_total + delivery_charge
     
     summary_message = (
@@ -688,23 +637,15 @@ def show_order_summary(token, customer_id, session_data, business_name):
         f"অর্ডারটি কনফার্ম করতে 'Confirm' লিখুন।\n"
         f"কোনো পরিবর্তন করতে চাইলে বলুন।"
     )
-    
     send_message(token, customer_id, summary_message)
     return summary_message
 
-# ================= FOLLOW-UP SYSTEM (NEW IMPLEMENTATION) =================
+# ================= FOLLOW-UP SYSTEM =================
 @app.route("/send-followup", methods=["POST"])
 def send_followup():
-    """Background task to send follow-up messages to inactive customers"""
     try:
-        # 1. Find sessions that haven't been updated for 1 hour AND no follow-up sent yet
         one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-        
-        res = supabase.table("order_sessions")\
-            .select("*")\
-            .lt("last_updated", one_hour_ago)\
-            .is_("last_followup_sent", "null")\
-            .execute()
+        res = supabase.table("order_sessions").select("*").lt("last_updated", one_hour_ago).is_("last_followup_sent", "null").execute()
         
         if not res.data:
             return jsonify({"status": "no_sessions_found"}), 200
@@ -712,17 +653,13 @@ def send_followup():
         for session in res.data:
             user_id = session['user_id']
             customer_id = session['customer_id']
-            page_id = session.get('page_id') # Ensure page_id is saved in session during webhook
+            page_id = session.get('page_id')
             
-            # Skip if subscription is not active
-            if not check_subscription_status(user_id):
-                continue
+            if not check_subscription_status(user_id): continue
                 
             page = get_page_client(page_id) if page_id else None
             if page:
                 token = page["page_access_token"]
-                
-                # Check current data status to customize message
                 s_data = session.get('data', {})
                 if not s_data.get('name') or not s_data.get('address'):
                     msg = "আপনি কি আমাদের পণ্যটি নিয়ে এখনো ভাবছেন? আপনার নাম ও ঠিকানা দিলে আমি অর্ডারটি রেডি করে দিতে পারতাম। 😊"
@@ -730,8 +667,6 @@ def send_followup():
                     msg = "আপনি আপনার সব তথ্য দিয়েছেন, অর্ডারটি কি আমি কনফার্ম করে দেব? কনফার্ম করতে শুধু 'Confirm' লিখুন।"
                 
                 send_message(token, customer_id, msg)
-                
-                # Update DB to mark follow-up as sent
                 supabase.table("order_sessions").update({"last_followup_sent": True}).eq("id", session['id']).execute()
                 
         return jsonify({"status": "success", "processed": len(res.data)}), 200
@@ -739,63 +674,47 @@ def send_followup():
         logger.error(f"Follow-up execution error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ================= BATCHED MESSAGE PROCESSOR (NEW) =================
+# ================= BATCHED MESSAGE PROCESSOR =================
 def process_batched_messages(sender, user_id, page_id, token):
-    """
-    Processes all accumulated messages from the queue after the timer expires.
-    This runs in a separate thread.
-    """
     try:
-        if sender not in user_queues or not user_queues[sender]:
-            return
-
-        # 1. Combine all messages into one text block
-        # Using space to join.
+        if sender not in user_queues or not user_queues[sender]: return
+        
         raw_text_list = user_queues[sender]
         raw_text = " ".join(raw_text_list)
         text = raw_text.lower().strip()
         
-        # Clear the queue for this user immediately
-        user_queues[sender] = []
-        if sender in user_timers:
-            del user_timers[sender]
+        # --- ADMIN COMMAND TO CLEAR CACHE ---
+        if text == "!refresh":
+            bot_data_cache.clear()
+            send_message(token, sender, "✅ System cache cleared. Fetched fresh data.")
+            user_queues[sender] = []
+            return
 
-        # 2. Show typing indicator (User knows bot is thinking)
+        user_queues[sender] = []
+        if sender in user_timers: del user_timers[sender]
+
         send_sender_action(token, sender, "typing_on")
 
-        # 3. Check Subscription
-        if not check_subscription_status(user_id):
-            logger.info(f"Subscription inactive for user {user_id}. Bot silent.")
-            return
+        if not check_subscription_status(user_id): return
 
-        # 4. Get Bot Settings & Handle Delay
         bot_settings = get_bot_settings(user_id)
-        if not bot_settings.get("ai_reply_enabled", True):
-            return
+        if not bot_settings.get("ai_reply_enabled", True): return
         
-        # --- DATABASE DELAY LOGIC MOVED HERE ---
-        # This sleep happens in the background thread, so it doesn't block the server
         delay_ms = bot_settings.get("typing_delay", 0)
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000)
+        if delay_ms > 0: time.sleep(delay_ms / 1000)
 
-        # 5. Core Logic (Copied from original Webhook)
         memory = get_chat_memory(user_id, sender)
         welcome_msg = bot_settings.get("welcome_message")
         
-        # Check if this is a fresh start after order confirmation
         session_id = f"order_{user_id}_{sender}"
         current_session = get_session_from_db(session_id)
         
-        # If no session exists, send welcome message
         if not current_session:
             if welcome_msg and not memory:
                 send_message(token, sender, welcome_msg)
                 save_chat_memory(user_id, sender, [{"role": "assistant", "content": welcome_msg}])
-            
             current_session = OrderSession(user_id, sender)
 
-        # Update page_id for follow-up purpose
         try:
             supabase.table("order_sessions").update({"page_id": page_id}).eq("id", session_id).execute()
         except: pass
@@ -807,60 +726,47 @@ def process_batched_messages(sender, user_id, page_id, token):
         extracted = extract_order_data_with_retry(user_id, temp_memory, delivery_policy)
         
         if extracted:
-            # --- FIXED: NOTIFY USER ABOUT DELIVERY CHARGE IMMEDIATELY ---
             had_address = bool(current_session.data.get("address"))
-            data_changed = False # Track if data actually changes
+            data_changed = False
             
-            # Only update if extracted data is NOT business details
             business_address = business.get('address', '') if business else ''
             business_phone = business.get('contact_number', '') if business else ''
             
-            # Check if extracted address is actually business address
-            if extracted.get("address") and business_address:
-                if business_address.lower() in extracted.get("address", "").lower():
-                    logger.info(f"Ignoring business address as customer address: {extracted.get('address')}")
-                else:
-                    if extracted.get("address") and extracted.get("address") != current_session.data.get("address"): 
-                        current_session.data["address"] = extracted["address"]
-                        data_changed = True
-            elif extracted.get("address") and extracted.get("address") != current_session.data.get("address"):
+            if extracted.get("address") and business_address and business_address.lower() not in extracted.get("address", "").lower():
+                if extracted.get("address") != current_session.data.get("address"): 
+                    current_session.data["address"] = extracted["address"]
+                    data_changed = True
+            elif extracted.get("address") and not business_address:
+                if extracted.get("address") != current_session.data.get("address"): 
                     current_session.data["address"] = extracted["address"]
                     data_changed = True
             
-            # Check if extracted phone is actually business phone
-            if extracted.get("phone") and business_phone:
-                if business_phone in extracted.get("phone", ""):
-                    logger.info(f"Ignoring business phone as customer phone: {extracted.get('phone')}")
-                else:
-                    if extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"): 
-                        current_session.data["phone"] = extracted["phone"]
-                        data_changed = True
-            elif extracted.get("phone") and extracted.get("phone") != current_session.data.get("phone"):
-                current_session.data["phone"] = extracted["phone"]
-                data_changed = True
+            if extracted.get("phone") and business_phone and business_phone not in extracted.get("phone", ""):
+                 if extracted.get("phone") != current_session.data.get("phone"): 
+                    current_session.data["phone"] = extracted["phone"]
+                    data_changed = True
+            elif extracted.get("phone") and not business_phone:
+                if extracted.get("phone") != current_session.data.get("phone"): 
+                    current_session.data["phone"] = extracted["phone"]
+                    data_changed = True
             
-            # For name
             if extracted.get("name") and extracted.get("name") != current_session.data.get("name"): 
                 current_session.data["name"] = extracted["name"]
                 data_changed = True
             
-            # For items
             if extracted.get("items") and extracted.get("items") != current_session.data.get("items"): 
                 current_session.data["items"] = extracted["items"]
                 data_changed = True
             
             if "delivery_charge" in extracted and isinstance(extracted["delivery_charge"], (int, float)):
                     current_session.data["delivery_charge"] = extracted["delivery_charge"]
-                    # Send notification only if address was just now extracted/updated
                     if not had_address and extracted.get("address"):
                         send_message(token, sender, f"আপনার ঠিকানায় ডেলিভারি চার্জ ৳{extracted['delivery_charge']}")
             
-            # Reset follow-up status when customer speaks
             try:
                 supabase.table("order_sessions").update({"last_followup_sent": None}).eq("id", session_id).execute()
             except: pass
             
-            # --- FIXED LOGIC: ONLY RESET SUMMARY IF DATA CHANGED ---
             is_confirming_now = any(w in text for w in ['confirm', 'ok', 'tik', 'done', 'yes', 'humm', 'ji', 'hae'])
             
             if data_changed and not is_confirming_now:
@@ -870,37 +776,27 @@ def process_batched_messages(sender, user_id, page_id, token):
 
         s_data = current_session.data
         has_all_info = all([s_data.get("name"), s_data.get("phone"), s_data.get("address"), s_data.get("items")])
-        
-        # SMART ORDER CONFIRMATION DETECTION
         is_confirmation, intent_type = detect_order_confirmation_intent(raw_text, s_data)
 
-        # Handle cancellation
         if "cancel" in text or "বাতিল" in text:
             delete_session_from_db(session_id)
             send_message(token, sender, "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।")
-            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": "অর্ডার সেশনটি বাতিল করা হয়েছে। নতুন অর্ডার দিতে চাইলে বলুন।"}])
+            save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": "অর্ডার সেশনটি বাতিল করা হয়েছে।"}])
             return
 
-        # ====================================================================
-        # LOGIC FLOW FIXED:
-        # 1. First Check if User WANTS to Confirm
-        # 2. Then Check if Summary NEEDS to be Shown
-        # 3. Else let AI reply
-        # ====================================================================
-
-        # Handle confirmation intent (PRIORITY 1)
+        # --- ORDER CONFIRMATION LOGIC ---
         if is_confirmation:
             if has_all_info:
-                products_db = get_products_with_details(user_id)
-                final_delivery_charge = float(s_data.get('delivery_charge', 0))
+                # IMPORTANT: Fetch FRESH products (bypass cache) for stock check
+                products_db = get_products_with_details(user_id, use_cache=False)
                 
+                final_delivery_charge = float(s_data.get('delivery_charge', 0))
                 items_total = 0
                 summary_list = []
                 order_success = True
                 insufficient_stock_products = []
                 out_of_stock_products = []
                 
-                # Stock check
                 for item in s_data.get('items', []):
                     product_name = item.get('product_name')
                     qty = int(item.get('quantity', 1))
@@ -924,16 +820,12 @@ def process_batched_messages(sender, user_id, page_id, token):
                     else:
                         order_success = False
                         send_message(token, sender, f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।")
-                        save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": f"❌ দুঃখিত, '{product_name}' পণ্যটি সনাক্ত করা যায়নি।"}])
                 
                 if out_of_stock_products:
-                    stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products)
-                    send_message(token, sender, stock_msg)
+                    send_message(token, sender, "❌ নিম্নলিখিত পণ্যগুলোর স্টক নেই:\n" + "\n".join(out_of_stock_products))
                     return
-                
                 if insufficient_stock_products:
-                    stock_msg = "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products)
-                    send_message(token, sender, stock_msg)
+                    send_message(token, sender, "❌ নিম্নলিখিত পণ্যগুলোর পর্যাপ্ত স্টক নেই:\n" + "\n".join(insufficient_stock_products))
                     return
                 
                 if order_success:
@@ -954,14 +846,12 @@ def process_batched_messages(sender, user_id, page_id, token):
                             product_name = item.get('product_name')
                             qty = int(item.get('quantity', 1))
                             if product_name:
-                                stock_updated = update_product_stock(user_id, product_name, qty)
-                                if not stock_updated:
+                                if not update_product_stock(user_id, product_name, qty):
                                     failed_products.append(product_name)
                                     all_stock_updates_successful = False
                         
                         if not all_stock_updates_successful:
-                            error_msg = f"❌ দুঃখিত, স্টক আপডেট সমস্যা: {', '.join(failed_products)}"
-                            send_message(token, sender, error_msg)
+                            send_message(token, sender, f"❌ দুঃখিত, স্টক আপডেট সমস্যা: {', '.join(failed_products)}")
                             return
                         
                         if current_session.save_order(product_total=items_total, delivery_charge=final_delivery_charge):
@@ -973,18 +863,14 @@ def process_batched_messages(sender, user_id, page_id, token):
                             )
                             send_message(token, sender, confirm_msg)
                             save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": confirm_msg}])
-                            
-                            # Cleanup
                             try:
                                 supabase.table("chat_history").delete().eq("user_id", user_id).eq("customer_id", sender).execute()
-                            except Exception as e:
-                                logger.error(f"Error clearing chat history: {e}")
+                            except: pass
                             delete_session_from_db(session_id)
                             current_session = None
-                            return # END HERE for confirmed orders
+                            return
                         else:
-                            error_msg = "❌ দুঃখিত, অর্ডার সেভ করতে সমস্যা হয়েছে।"
-                            send_message(token, sender, error_msg)
+                            send_message(token, sender, "❌ দুঃখিত, অর্ডার সেভ করতে সমস্যা হয়েছে।")
                             return
             else:
                 missing = []
@@ -992,48 +878,34 @@ def process_batched_messages(sender, user_id, page_id, token):
                 if not s_data.get("phone"): missing.append("ফোন নম্বর")
                 if not s_data.get("address"): missing.append("ঠিকানা")
                 if not s_data.get("items"): missing.append("পণ্য")
-                needed_info = " ও ".join(missing)
-                response_msg = f"দুঃখিত, আপনার {needed_info} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।"
-                send_message(token, sender, response_msg)
+                send_message(token, sender, f"দুঃখিত, আপনার {' ও '.join(missing)} এখনো পাওয়া যায়নি। অর্ডার নিশ্চিত করতে এই তথ্যগুলো দিন।")
                 return
 
-        # Handle delay/deny (PRIORITY 2)
         elif intent_type == 'delay':
-            delay_msg = "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। 😊"
-            send_message(token, sender, delay_msg)
+            send_message(token, sender, "বেশ তো, কোনো সমস্যা নেই। যখনই ঠিক করবেন আমাকে জানাবেন। 😊")
             return
         elif intent_type == 'deny':
-            deny_msg = "ঠিক আছে, কোনো সমস্যা নেই। ধন্যবাদ! 😊"
-            send_message(token, sender, deny_msg)
+            send_message(token, sender, "ঠিক আছে, কোনো সমস্যা নেই। ধন্যবাদ! 😊")
             delete_session_from_db(session_id)
             return
 
-        # Show Summary Trigger (PRIORITY 3 - Only if not confirming and has all info)
         if has_all_info and not s_data.get("summary_shown", False):
-            business = get_business_settings(user_id)
             business_name = business.get('name', 'আমাদের শপ') if business else "আমাদের শপ"
             s_data['user_id_from_session'] = user_id 
             summary_message = show_order_summary(token, sender, s_data, business_name)
-            
             s_data["summary_shown"] = True
             current_session.data = s_data
             save_session_to_db(current_session)
-            
             save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": summary_message}])
             return
 
-        # ====================================================================
-        # HYBRID MODE LOGIC (FINAL PRIORITY)
-        # ====================================================================
+        # ================= AI REPLY (HYBRID) =================
         if bot_settings.get("hybrid_mode", True):
-            # Check if session exists (it might be None if order was JUST completed)
             session_data_for_ai = current_session.data if current_session else {}
-            
             reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, session_data_for_ai)
             
             if reply:
                 if current_session and s_data.get("summary_shown", False):
-                    # Reset summary if user talks after summary but doesn't confirm
                     current_session.data["summary_shown"] = False
                     save_session_to_db(current_session)
                 
@@ -1043,21 +915,16 @@ def process_batched_messages(sender, user_id, page_id, token):
 
         elif bot_settings.get("faq_only_mode", False):
             faqs = get_faqs(user_id)
-            faq_reply = None
             for f in faqs:
                 if f['question'] and f['question'].lower() in text:
-                    faq_reply = f['answer']
+                    send_message(token, sender, f['answer'])
+                    save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": f['answer']}])
                     break
-            if faq_reply:
-                send_message(token, sender, faq_reply)
-                save_chat_memory(user_id, sender, memory + [{"role": "user", "content": raw_text}, {"role": "assistant", "content": faq_reply}])
 
     except Exception as e:
         logger.error(f"Error in batched processing: {e}", exc_info=True)
 
-
-# ================= WEBHOOK (UPDATED FOR BATCHING) =================
-
+# ================= WEBHOOK =================
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     global processed_messages 
@@ -1076,7 +943,6 @@ def webhook():
     if not data: return jsonify({"status": "error"}), 400
 
     if data.get("object") == "page":
-        # Clean old processed messages
         now_ts = time.time()
         processed_messages = {k: v for k, v in processed_messages.items() if now_ts - v < 300}
         
@@ -1099,24 +965,18 @@ def webhook():
                 raw_text = msg_event["message"].get("text", "")
                 if not raw_text: continue
                 
-                # --- NEW BATCHING LOGIC START ---
-                # 1. Mark Seen immediately so user knows we got it
                 send_sender_action(token, sender, "mark_seen")
 
-                # 2. Add message to queue
                 if sender not in user_queues:
                     user_queues[sender] = []
                 user_queues[sender].append(raw_text)
 
-                # 3. Reset Timer (Debouncing)
                 if sender in user_timers:
                     user_timers[sender].cancel()
 
-                # 4. Start new timer (waits 3.0 seconds for more messages)
                 t = threading.Timer(3.0, process_batched_messages, args=[sender, user_id, page_id, token])
                 user_timers[sender] = t
                 t.start()
-                # --- NEW BATCHING LOGIC END ---
 
     return jsonify({"ok": True}), 200
 
