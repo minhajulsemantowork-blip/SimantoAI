@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# --- Smart Caching Variables (NEW) ---
+# --- Smart Caching Variables ---
 bot_data_cache = {}        # { "user_id_key": (data, timestamp) }
 api_key_status = {}        # { "api_key": blocked_until_timestamp }
 CACHE_EXPIRY = 600         # ১০ মিনিট (ডাটা রিফ্রেশ টাইম)
@@ -35,7 +35,7 @@ try:
 except Exception as e:
     logger.error(f"Supabase connection failed: {e}")
 
-# ================= SMART CACHING HELPERS (NEW) =================
+# ================= SMART CACHING HELPERS =================
 def get_cached_data(user_id: str, suffix: str, fetch_func):
     """
     Retrieves data from cache or fetches fresh from DB if expired.
@@ -69,8 +69,6 @@ def block_api_key(api_key: str):
 # ================= SUBSCRIPTION CHECKER =================
 def check_subscription_status(user_id: str) -> bool:
     try:
-        # Subscription status is critical, usually not cached or cached for very short time
-        # Here we keep it real-time as per original logic to avoid access issues
         res = supabase.table("subscriptions").select("status, trial_end, end_date, paid_until").eq("user_id", user_id).execute()
         
         if res.data and len(res.data) > 0:
@@ -89,7 +87,6 @@ def check_subscription_status(user_id: str) -> bool:
                     if clean_expiry.endswith('+00'):
                         clean_expiry = clean_expiry.replace('+00', '+00:00')
                     
-                    # Parsing logic same as before
                     try:
                         expiry_date = datetime.fromisoformat(clean_expiry)
                     except ValueError:
@@ -138,11 +135,6 @@ def get_business_settings(user_id: str) -> Optional[Dict]:
     return get_cached_data(user_id, "biz_settings", fetch)
 
 def get_products_with_details(user_id: str, use_cache=True):
-    """
-    Fetches products.
-    use_cache=True -> Returns cached data (Fast, for Chat)
-    use_cache=False -> Returns fresh data (Slow, for Order Confirmation/Stock Check)
-    """
     def fetch():
         res = supabase.table("products").select("*").eq("user_id", user_id).execute()
         return res.data or []
@@ -158,7 +150,6 @@ def get_faqs(user_id: str):
     return get_cached_data(user_id, "faqs", fetch) or []
 
 def get_valid_api_keys(user_id: str):
-    """Fetches API keys from DB (cached) and filters out blocked ones."""
     def fetch():
         res = supabase.table("api_keys").select("groq_api_key, groq_api_key_2, groq_api_key_3, groq_api_key_4, groq_api_key_5").eq("user_id", user_id).execute()
         if res.data:
@@ -237,7 +228,6 @@ def delete_session_from_db(session_id: str):
 
 # ================= HELPERS (IMAGE & MSG) =================
 def get_page_client(page_id):
-    # This is lightweight, but could be cached if needed. Keeping real-time for safety.
     res = supabase.table("facebook_integrations").select("*").eq("page_id", str(page_id)).eq("is_connected", True).execute()
     return res.data[0] if res.data else None
 
@@ -291,7 +281,6 @@ def save_chat_memory(user_id: str, customer_id: str, messages: List[Dict]):
 
 # ================= PRODUCT STOCK UPDATER =================
 def update_product_stock(user_id: str, product_name: str, quantity_sold: int) -> bool:
-    """Update product stock in database after order confirmation (Always Real-time)"""
     try:
         logger.info(f"Updating stock for product '{product_name}' for user {user_id}, quantity: {quantity_sold}")
         
@@ -325,7 +314,7 @@ def update_product_stock(user_id: str, product_name: str, quantity_sold: int) ->
         logger.error(f"Error updating product stock: {str(e)}", exc_info=True)
     return False
 
-# ================= AI LOGIC (UPDATED WITH SMART API & CACHE) =================
+# ================= AI LOGIC =================
 def generate_ai_reply_with_retry(user_id, customer_id, user_msg, current_session_data):
     # Fetch cached data
     business = get_business_settings(user_id)
@@ -449,7 +438,6 @@ FAQ: {faq_text}
 
     memory = get_chat_memory(user_id, customer_id)
     
-    # --- SMART API KEY SELECTION ---
     valid_keys = get_valid_api_keys(user_id)
 
     if not valid_keys:
@@ -468,7 +456,6 @@ FAQ: {faq_text}
             reply = res.choices[0].message.content.strip()
             save_chat_memory(user_id, customer_id, (memory + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}])[-10:])
             
-            # --- STRICT IMAGE LOGIC ---
             matched_image = None
             image_request_keywords = ['chobi', 'photo', 'image', 'dekhan', 'dekhi', 'ছবি', 'দেখাও', 'দেখি', 'pic']
             wants_to_see_image = any(word in user_msg.lower() for word in image_request_keywords)
@@ -484,17 +471,16 @@ FAQ: {faq_text}
 
         except Exception as e:
             error_msg = str(e).lower()
-            # If Rate Limit Error, Block the Key
             if "rate_limit" in error_msg or "429" in error_msg:
                 block_api_key(key)
-                continue # Try next key
+                continue 
             
             logger.error(f"AI Generation Error: {e}")
             continue 
     
     return None, None
 
-# ================= ORDER EXTRACTION (UPDATED) =================
+# ================= ORDER EXTRACTION =================
 def extract_order_data_with_retry(user_id, messages, delivery_policy_text, max_retries=2):
     valid_keys = get_valid_api_keys(user_id)
     if not valid_keys: return None
@@ -603,7 +589,6 @@ def show_order_summary(token, customer_id, session_data, business_name):
     items = session_data.get('items', [])
     delivery_charge = session_data.get('delivery_charge', 0)
     
-    # Cached products are fine for summary display (price mostly static)
     user_id = session_data.get('user_id_from_session', '')
     products_db = get_products_with_details(user_id, use_cache=True) if user_id else []
     
@@ -679,11 +664,13 @@ def process_batched_messages(sender, user_id, page_id, token):
     try:
         if sender not in user_queues or not user_queues[sender]: return
         
+        # FIX 2: Refresh typing indicator at the start of processing thread
+        send_sender_action(token, sender, "typing_on")
+
         raw_text_list = user_queues[sender]
         raw_text = " ".join(raw_text_list)
         text = raw_text.lower().strip()
         
-        # --- ADMIN COMMAND TO CLEAR CACHE ---
         if text == "!refresh":
             bot_data_cache.clear()
             send_message(token, sender, "✅ System cache cleared. Fetched fresh data.")
@@ -693,6 +680,7 @@ def process_batched_messages(sender, user_id, page_id, token):
         user_queues[sender] = []
         if sender in user_timers: del user_timers[sender]
 
+        # Ensure typing is on
         send_sender_action(token, sender, "typing_on")
 
         if not check_subscription_status(user_id): return
@@ -787,7 +775,6 @@ def process_batched_messages(sender, user_id, page_id, token):
         # --- ORDER CONFIRMATION LOGIC ---
         if is_confirmation:
             if has_all_info:
-                # IMPORTANT: Fetch FRESH products (bypass cache) for stock check
                 products_db = get_products_with_details(user_id, use_cache=False)
                 
                 final_delivery_charge = float(s_data.get('delivery_charge', 0))
@@ -902,6 +889,10 @@ def process_batched_messages(sender, user_id, page_id, token):
         # ================= AI REPLY (HYBRID) =================
         if bot_settings.get("hybrid_mode", True):
             session_data_for_ai = current_session.data if current_session else {}
+            
+            # FIX 3: Refresh typing indicator right before AI call (since it takes time)
+            send_sender_action(token, sender, "typing_on")
+            
             reply, product_image = generate_ai_reply_with_retry(user_id, sender, raw_text, session_data_for_ai)
             
             if reply:
@@ -973,6 +964,9 @@ def webhook():
 
                 if sender in user_timers:
                     user_timers[sender].cancel()
+
+                # FIX 1: Send typing ON immediately so user knows bot received message
+                send_sender_action(token, sender, "typing_on")
 
                 t = threading.Timer(3.0, process_batched_messages, args=[sender, user_id, page_id, token])
                 user_timers[sender] = t
